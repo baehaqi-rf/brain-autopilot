@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brain-autopilot"
+version = "1.0.0"
+description = "Continually learning real-time autonomous verification, exploration, and playtesting engine for Web Apps (Next.js/React/Astro), Mobile Apps (Expo/React Native/Flutter/ADB), and 3D/WebGL Apps."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+brain-autopilot = "brain_autopilot.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["brain_autopilot*"]
+namespaces = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]

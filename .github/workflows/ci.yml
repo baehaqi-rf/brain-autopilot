@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package and pytest
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Run unit and integration tests
+        run: |
+          python tests/run_tests.py
+          pytest -q
+      - name: Run repository consistency validator
+        run: python tests/validate_repo.py
+      - name: CLI smoke check
+        run: |
+          brain-autopilot --version
+          brain-autopilot codex . --no-update
+          bash -n install.sh
