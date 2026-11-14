@@ -23,6 +23,7 @@ All notable changes to this project are documented here. The format follows [Kee
 ### Fixed
 - Wired automatic frame recording (`App(on_frame=...)`) into `ActiveSession` and `run_harness` so `describe_frames` always receives episode screenshots.
 - Preserved query strings and subpaths when `WebEngine.navigate()` receives a full HTTP(S) URL.
+- Fixed cross-platform project path normalization in `Redactor` and thread-safe socket shutdown in `CDPSession._read_loop` across Windows and POSIX hosts.
 
 ## [1.0.0] - 2026-11-08
 

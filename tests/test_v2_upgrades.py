@@ -80,6 +80,12 @@ def test_redactor_scrubs_secrets_emails_and_paths(tmp_path: Path) -> None:
     assert cleaned["contact"] == "[email]"
     assert "<project>" in cleaned["file"]
 
+    # Cross-platform project roots must redact reliably on both Windows and POSIX hosts
+    win_red = Redactor(project_root=r"C:\Users\alice\proj")
+    assert win_red.text(r"C:\Users\alice\proj\src\index.ts") == r"<project>\src\index.ts"
+    posix_red = Redactor(project_root="/home/alice/proj")
+    assert posix_red.text("/home/alice/proj/src/index.ts") == "<project>/src/index.ts"
+
 
 def test_regression_save_and_zero_llm_replay(tmp_path: Path) -> None:
     app_dir = tmp_path / "app"

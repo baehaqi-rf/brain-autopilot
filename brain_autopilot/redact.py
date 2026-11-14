@@ -57,8 +57,13 @@ class Redactor:
         self.secrets = [s for s in (extra_secrets or []) if isinstance(s, str) and len(s) >= 6]
         self.project_patterns: list[re.Pattern[str]] = []
         if project_root and len(project_root) > 3:
-            norm = os.path.abspath(project_root).rstrip("\\/")
-            variants = {norm, norm.replace("\\", "/"), norm.replace("/", "\\")}
+            raw_root = str(project_root).rstrip("\\/")
+            # Preserve foreign OS absolute paths (e.g. Windows drive paths on POSIX CI runners)
+            # without letting os.path.abspath prepend the local working directory.
+            looks_win_abs = bool(re.match(r"^[A-Za-z]:[\\/]", raw_root))
+            looks_posix_abs = raw_root.startswith("/")
+            base = raw_root if (looks_win_abs or looks_posix_abs) else os.path.abspath(raw_root).rstrip("\\/")
+            variants = {base, base.replace("\\", "/"), base.replace("/", "\\")}
             for v in sorted(variants, key=len, reverse=True):
                 self.project_patterns.append(re.compile(re.escape(v), re.I))
 
@@ -71,7 +76,7 @@ class Redactor:
         user = _current_user()
         self.user_pattern = (
             re.compile(rf"(?<![A-Za-z0-9_]){re.escape(user)}(?![A-Za-z0-9_])", re.I)
-            if user and len(user) >= 4 and user.lower() not in {"user", "root", "admin", "test"}
+            if user and len(user) >= 4 and user.lower() not in {"user", "root", "admin", "test", "runner", "ci"}
             else None
         )
 

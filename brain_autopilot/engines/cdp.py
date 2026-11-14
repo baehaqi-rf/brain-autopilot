@@ -352,6 +352,10 @@ class _WebSocketClient:
         if not self.closed:
             self.closed = True
             try:
+                self._sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
                 self._sock.close()
             except OSError:
                 pass
@@ -457,10 +461,10 @@ class CDPSession:
         self.eval_js(TELEMETRY_INIT_JS)
 
     def _read_loop(self) -> None:
-        assert self._ws is not None
-        while not self._ws.closed:
+        ws = self._ws
+        while ws is not None and not ws.closed and self._ws is ws:
             try:
-                raw = self._ws.recv_text()
+                raw = ws.recv_text()
             except (OSError, EOFError):
                 break
             if raw is None:
@@ -511,7 +515,8 @@ class CDPSession:
                 self.current_url = str(frame["url"])
 
     def call(self, method: str, params: dict[str, Any] | None = None, timeout: float = 10.0) -> dict[str, Any]:
-        if not self.connected or self._ws is None:
+        ws = self._ws
+        if not self.connected or ws is None:
             raise RuntimeError("CDP session is not connected.")
         cid = next(self._ids)
         ev = threading.Event()
@@ -519,7 +524,7 @@ class CDPSession:
         with self._lock:
             self._pending[cid] = (ev, box)
         try:
-            self._ws.send_text(json.dumps({"id": cid, "method": method, "params": params or {}}))
+            ws.send_text(json.dumps({"id": cid, "method": method, "params": params or {}}))
             if not ev.wait(timeout=timeout):
                 raise TimeoutError(f"CDP call timed out: {method}")
             if "error" in box:
@@ -667,9 +672,13 @@ class CDPSession:
         return base64.b64decode(b64) if b64 else None
 
     def close(self) -> None:
-        if self._ws is not None:
-            self._ws.close()
-            self._ws = None
+        ws = self._ws
+        self._ws = None
+        if ws is not None:
+            ws.close()
+        if self._reader is not None and self._reader.is_alive() and threading.current_thread() is not self._reader:
+            self._reader.join(timeout=1.0)
+        self._reader = None
         if self._proc is not None:
             try:
                 self._proc.terminate()
