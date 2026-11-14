@@ -1,0 +1,435 @@
+"""Reproducible Benchmark Suite (`brain-autopilot bench`) for Web, Mobile, 3D/WebGL, Detectors & Regressions.
+
+Benchmarked against `ramenvr/autopilot/bench/`, BU Bench, and Maestro flows:
+- Spins up an isolated local HTTP SPA + 3D Canvas server (`ThreadingHTTPServer`).
+- Runs real Headless Chrome/Edge CDP end-to-end when a browser binary is installed (or falls
+  back cleanly to HTTP/in-memory mode where noted in results).
+- Scores multi-step harness completion, detector precision/mute handling, zero-LLM regression
+  replay, mobile ADB XML accessibility auditing, and blind vision isolation.
+"""
+
+from __future__ import annotations
+
+import functools
+import http.server
+import json
+import os
+import socketserver
+import tempfile
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+from . import detectors, memory, regress, runtime, vision
+from .engines import MobileEngine, WebEngine, WebGL3DEngine
+from .engines.cdp import find_browser_binary
+from .kit import App, Harness, Option, Result, Status, Step, click_and_wait, fill_form, navigate_to, submit_form_idempotent
+from .redact import Redactor
+
+_APP_HTML: dict[str, str] = {
+    "/": """<!doctype html>
+<html><head><title>Bench Shop</title></head>
+<body>
+  <h1 id="heading">Bench Store</h1>
+  <a href="/shop" data-testid="nav-shop" style="display:inline-block;padding:16px 24px;">Browse Shop</a>
+  <a href="/buggy" data-testid="nav-buggy" style="display:inline-block;padding:16px 24px;">Buggy Page</a>
+</body></html>""",
+    "/shop": """<!doctype html>
+<html><head><title>Catalog</title></head>
+<body>
+  <h1>Catalog</h1>
+  <div id="cart-count" data-testid="cart-count">0</div>
+  <button id="add-btn" data-testid="add-item" style="min-width:120px;min-height:48px;"
+    onclick="const c=document.getElementById('cart-count');c.textContent=String(Number(c.textContent)+1);">Add Item</button>
+  <button id="preview-btn" data-testid="preview-item" style="min-width:120px;min-height:48px;"
+    onclick="document.getElementById('preview-note').textContent='Selected Widget';">Preview</button>
+  <p id="preview-note"></p>
+  <a href="/checkout" data-testid="go-checkout" style="display:inline-block;padding:16px 24px;">Go Checkout</a>
+</body></html>""",
+    "/checkout": """<!doctype html>
+<html><head><title>Checkout</title></head>
+<body>
+  <h1>Checkout</h1>
+  <input id="email" data-testid="email" placeholder="Email" />
+  <button id="submit-order" data-testid="submit-order" style="min-width:140px;min-height:48px;"
+    onclick="if(!this.disabled && document.getElementById('email').value){this.disabled=true;document.getElementById('status').textContent='CONFIRMED';}">
+    Submit Order
+  </button>
+  <div id="status" data-testid="order-confirmed">PENDING</div>
+</body></html>""",
+    "/buggy": """<!doctype html>
+<html><head><title>Buggy</title></head>
+<body style="margin:0;">
+  <div style="width:2400px;height:40px;background:#eee;">Wide Overflow Banner</div>
+  <button id="tiny-btn" style="width:16px;height:16px;padding:0;font-size:8px;">x</button>
+  <img src="/missing-asset.png" alt="missing" />
+  <script>
+    console.error("BENCH_SYNTHETIC_CONSOLE_ERROR");
+    fetch("/api/missing-404").catch(() => {});
+  </script>
+</body></html>""",
+    "/canvas-ok": """<!doctype html>
+<html><head><title>3D Scene</title></head>
+<body>
+  <canvas id="scene" width="320" height="240" style="width:320px;height:240px;"></canvas>
+  <script>
+    const c = document.getElementById("scene");
+    const ctx = c.getContext("2d");
+    ctx.fillStyle = "#22aa88";
+    ctx.fillRect(0, 0, 320, 240);
+  </script>
+</body></html>""",
+    "/canvas-blank": """<!doctype html>
+<html><head><title>Blank Scene</title></head>
+<body>
+  <canvas id="scene" width="320" height="240" style="width:320px;height:240px;"></canvas>
+</body></html>""",
+}
+
+
+class _BenchHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802
+        path = self.path.split("?", 1)[0]
+        if path == "/favicon.ico":
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path in _APP_HTML:
+            body = _APP_HTML[path].encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            body = b"Not found"
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        return
+
+
+class _QuietTCPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        return
+
+
+class _LocalBenchServer:
+    def __init__(self) -> None:
+        self._httpd = _QuietTCPServer(("127.0.0.1", 0), _BenchHandler)
+        self._httpd.daemon_threads = True
+        port = self._httpd.server_address[1]
+        self.base_url = f"http://127.0.0.1:{port}"
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+
+    def __enter__(self) -> _LocalBenchServer:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self._httpd.shutdown()
+        self._httpd.server_close()
+
+
+def _bench_w1_checkout_and_regress(base_url: str, live_cdp: bool) -> dict[str, Any]:
+    t0 = time.monotonic()
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "shop-app"
+        mem_dir = Path(tmp) / "mem"
+        run_dir = mem_dir / "runs" / "bench-w1"
+        root.mkdir(parents=True)
+        run_dir.mkdir(parents=True)
+        (root / "package.json").write_text('{"name":"bench-shop","dependencies":{"next":"15.0.0"}}', encoding="utf-8")
+
+        harness_code = '''
+from brain_autopilot.kit import *
+
+class BenchCheckoutHarness(Harness):
+    goal = "Browse shop, add item to cart, fill email, and submit checkout cleanly"
+    start_route = "/shop"
+    tick_hz = 20.0
+    stall_seconds = 10.0
+
+    def setup(self, app):
+        self.plan = [
+            Step("add_item", "Add item to cart", done=lambda o: o["cart_count"] >= 1, options=["add_to_cart", "preview_item"]),
+            Step("checkout", "Go to checkout and submit order", done=lambda o: o["confirmed"], options=["go_checkout", "fill_email", "submit_order"]),
+        ]
+
+    def observe(self, app):
+        if app.engine._cdp is None:
+            # Offline HTML fallback simulation
+            route = app.route()
+            cnt = int(app.get("cart", "count") or 0)
+            conf = bool(app.get("checkout", "confirmed"))
+            return {"route": route, "cart_count": cnt, "email_filled": bool(app.get("checkout", "email")), "confirmed": conf}
+        route, txt_cnt, txt_status, email_val = app.batch([
+            lambda: app.route(),
+            lambda: app.get("[data-testid='cart-count']", "text"),
+            lambda: app.get("[data-testid='order-confirmed']", "text"),
+            lambda: app.get("[data-testid='email']", "value"),
+        ])
+        return {
+            "route": route,
+            "cart_count": int(str(txt_cnt or "0").strip() or 0),
+            "email_filled": bool(str(email_val or "").strip()),
+            "confirmed": str(txt_status or "").strip() == "CONFIRMED",
+        }
+
+    def options(self, obs):
+        def do_add(app, o):
+            if app.engine._cdp is None:
+                yield
+                app.engine.set_state_direct("cart", "count", int(app.get("cart", "count") or 0) + 1)
+                return Result(True, "added offline")
+            return (yield from click_and_wait(app, "[data-testid='add-item']"))
+
+        def do_preview(app, o):
+            if app.engine._cdp is None:
+                yield
+                return Result(True, "previewed offline")
+            return (yield from click_and_wait(app, "[data-testid='preview-item']"))
+
+        def do_go_checkout(app, o):
+            if app.engine._cdp is None:
+                yield
+                app.navigate("/checkout")
+                return Result(True, "went checkout")
+            return (yield from navigate_to(app, "/checkout"))
+
+        def do_fill_email(app, o):
+            if app.engine._cdp is None:
+                yield
+                app.engine.set_state_direct("checkout", "email", "qa@example.com")
+                return Result(True, "filled email")
+            return (yield from fill_form(app, {"[data-testid='email']": "qa@example.com"}))
+
+        def do_submit(app, o):
+            if app.engine._cdp is None:
+                yield
+                app.engine.set_state_direct("checkout", "confirmed", True)
+                return Result(True, "confirmed offline")
+            return (yield from submit_form_idempotent(app, "[data-testid='submit-order']"))
+
+        return [
+            Option("add_to_cart", "Add item to cart", do_add, effect=lambda a, b: b["cart_count"] > a["cart_count"]),
+            Option("preview_item", "Preview item", do_preview, effect=lambda a, b: True),
+            Option("go_checkout", "Open checkout", do_go_checkout, effect=lambda a, b: "/checkout" in b["route"]),
+            Option("fill_email", "Fill email", do_fill_email, effect=lambda a, b: b["email_filled"]),
+            Option("submit_order", "Submit order", do_submit, effect=lambda a, b: b["confirmed"]),
+        ]
+
+    def status(self, obs):
+        if obs["confirmed"]:
+            return Status("done", "order confirmed", {"cart_count": obs["cart_count"], "confirmed": True})
+        return Status()
+'''
+        h_path = run_dir / "harness1.py"
+        h_path.write_text(harness_code, encoding="utf-8")
+
+        engine = WebEngine(project_root=str(root), base_url=base_url, use_cdp=live_cdp)
+        frames = vision.Frames()
+        app = App(engine, mode="episode", on_frame=lambda d, ts, lbl: frames.add(d, app_time=ts, label=lbl))
+        try:
+            ep = runtime.run_harness(
+                h_path,
+                app,
+                seconds=15.0,
+                trace_path=run_dir / "trace1.jsonl",
+                mem_dir=mem_dir,
+            )
+            ok_report, _ = runtime.validate_report(
+                {"outcome": "CONFIRMED", "summary": "Checkout verified", "evidence": ["trace1.jsonl"]},
+                [ep],
+            )
+            reg_saved = regress.save(
+                run_dir,
+                {"run_id": "bench-w1", "outcome": "CONFIRMED", "summary": "Checkout verified", "evidence": ["trace1.jsonl"]},
+                root,
+                mem_dir=mem_dir,
+            )
+        finally:
+            app.close()
+
+        reg_summary = regress.replay_all(
+            root,
+            base_url=base_url,
+            mem_dir=mem_dir,
+            app_factory=lambda eng: App(WebEngine(project_root=str(root), base_url=base_url, use_cdp=live_cdp)),
+        )
+        passed = bool(
+            ep["state"] == "done"
+            and ok_report
+            and reg_saved
+            and reg_summary["passed"] == 1
+            and (not live_cdp or len(frames._items) >= 2)
+        )
+        return {
+            "id": "W1_checkout_and_regress",
+            "mode": "cdp" if live_cdp else "offline",
+            "passed": passed,
+            "decisions": ep["decisions"],
+            "multi_option_decisions": ep["multi_option_decisions"],
+            "frames_captured": len(frames._items),
+            "regression_passed": reg_summary["passed"],
+            "seconds": round(time.monotonic() - t0, 2),
+        }
+
+
+def _bench_w2_bug_detectors(base_url: str, live_cdp: bool) -> dict[str, Any]:
+    t0 = time.monotonic()
+    with tempfile.TemporaryDirectory() as tmp:
+        mem_dir = Path(tmp) / "mem"
+        memory.ensure_scaffold(str(mem_dir))
+        engine = WebEngine(base_url=base_url, use_cdp=live_cdp)
+        app = App(engine, mode="probe")
+        try:
+            if live_cdp:
+                app.navigate("/buggy")
+                time.sleep(0.35)
+                findings = app.findings(mem_dir=str(mem_dir))
+                sigs = {f["detector"] for f in findings}
+                expected = {"console_error", "network_error", "horizontal_overflow", "touch_target", "broken_image"}
+                det_ok = expected <= sigs
+            else:
+                engine._console_errors = ["BENCH_SYNTHETIC_CONSOLE_ERROR"]
+                engine._network_errors = [{"url": "/api/missing-404", "status": 404}]
+                engine._metrics.update({"overflow_elements": 1, "touch_target_violations": 1, "broken_images": 1})
+                findings = app.findings(mem_dir=str(mem_dir))
+                sigs = {f["detector"] for f in findings}
+                det_ok = {"console_error", "network_error", "horizontal_overflow", "touch_target", "broken_image"} <= sigs
+
+            # Verify mute filtering works
+            detectors.mute(str(mem_dir), "console_error")
+            after_mute = {f["detector"] for f in app.findings(mem_dir=str(mem_dir))}
+            mute_ok = "console_error" not in after_mute
+        finally:
+            app.close()
+        return {
+            "id": "W2_bug_detectors_and_mute",
+            "mode": "cdp" if live_cdp else "offline",
+            "passed": bool(det_ok and mute_ok),
+            "detected": sorted(sigs),
+            "seconds": round(time.monotonic() - t0, 2),
+        }
+
+
+def _bench_m1_mobile_accessibility() -> dict[str, Any]:
+    t0 = time.monotonic()
+    mob = MobileEngine()
+    mob.load_uiautomator_xml(
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<hierarchy>"
+        '<node text="Continue" resource-id="btn_continue" class="android.widget.Button" clickable="true" enabled="true" bounds="[100,400][500,490]" />'
+        '<node text="X" resource-id="btn_close_tiny" class="android.widget.Button" clickable="true" enabled="true" bounds="[10,10][36,36]" />'
+        "</hierarchy>"
+    )
+    app = App(mob)
+    findings = app.findings()
+    passed = (
+        mob.element_exists("btn_continue")
+        and mob.get_metrics()["touch_target_violations"] == 1
+        and any(f["detector"] == "touch_target" for f in findings)
+    )
+    return {
+        "id": "M1_mobile_uiautomator_touch_audit",
+        "mode": "xml",
+        "passed": bool(passed),
+        "violations": mob.get_metrics()["touch_target_violations"],
+        "seconds": round(time.monotonic() - t0, 2),
+    }
+
+
+def _bench_d1_webgl3d_canvas(base_url: str, live_cdp: bool) -> dict[str, Any]:
+    t0 = time.monotonic()
+    eng = WebGL3DEngine(base_url=base_url, use_cdp=live_cdp)
+    app = App(eng)
+    try:
+        if live_cdp:
+            app.navigate("/canvas-ok")
+            m_ok = app.metrics()
+            app.navigate("/canvas-blank")
+            m_blank = app.metrics()
+            findings_blank = app.findings()
+            passed = (
+                m_ok.get("canvas_present") is True
+                and m_ok.get("canvas_blank") is False
+                and m_blank.get("canvas_blank") is True
+                and any(f["detector"] == "blank_canvas" for f in findings_blank)
+            )
+        else:
+            eng.update_scene_telemetry({"canvas_present": True, "canvas_blank": False, "fps": 60.0, "draw_calls": 42})
+            m_ok = app.metrics()
+            eng.update_scene_telemetry({"canvas_blank": True})
+            findings_blank = app.findings()
+            passed = m_ok["draw_calls"] == 42 and any(f["detector"] == "blank_canvas" for f in findings_blank)
+    finally:
+        app.close()
+    return {
+        "id": "D1_webgl3d_canvas_health",
+        "mode": "cdp" if live_cdp else "offline",
+        "passed": bool(passed),
+        "seconds": round(time.monotonic() - t0, 2),
+    }
+
+
+def _bench_v1_vision_and_redaction() -> dict[str, Any]:
+    t0 = time.monotonic()
+    frames = vision.Frames()
+    frames.add(b"frame_a", app_time=0.5)
+    frames.add(b"frame_b", app_time=1.0)
+    payload = vision.build_blind_vision_payload(
+        ["What text appears on the confirmation banner?", "Is the order confirmed?"],
+        frames.select(),
+    )
+    red = Redactor(project_root=r"C:\Users\alice\proj")
+    scrubbed = red.text(r"token=sk-1234567890abcdef1234 email alice@example.com in C:\Users\alice\proj\app.tsx")
+    passed = (
+        len(payload["warnings"]) == 1
+        and payload["frame_count"] == 2
+        and "sk-1234567890" not in scrubbed
+        and "alice@example.com" not in scrubbed
+        and "<project>" in scrubbed
+    )
+    return {
+        "id": "V1_blind_vision_and_redaction",
+        "mode": "unit",
+        "passed": bool(passed),
+        "seconds": round(time.monotonic() - t0, 2),
+    }
+
+
+def run_benchmark(live_browser: bool | str = "auto") -> dict[str, Any]:
+    """Execute the full Brain Autopilot benchmark suite and return scored summary."""
+    has_browser = find_browser_binary() is not None
+    use_cdp = has_browser if live_browser == "auto" else bool(live_browser and has_browser)
+    started = time.monotonic()
+
+    with _LocalBenchServer() as srv:
+        results = [
+            _bench_w1_checkout_and_regress(srv.base_url, use_cdp),
+            _bench_w2_bug_detectors(srv.base_url, use_cdp),
+            _bench_m1_mobile_accessibility(),
+            _bench_d1_webgl3d_canvas(srv.base_url, use_cdp),
+            _bench_v1_vision_and_redaction(),
+        ]
+
+    passed_count = sum(1 for r in results if r["passed"])
+    return {
+        "suite": "brain-autopilot-core-v2",
+        "browser_available": has_browser,
+        "cdp_enabled": use_cdp,
+        "score": passed_count,
+        "total": len(results),
+        "pass_rate": round(passed_count / max(1, len(results)), 3),
+        "seconds": round(time.monotonic() - started, 2),
+        "results": results,
+    }

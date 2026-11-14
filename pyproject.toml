@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "brain-autopilot"
-version = "1.0.0"
+version = "2.0.0"
 description = "Continually learning real-time autonomous verification, exploration, and playtesting engine for Web Apps (Next.js/React/Astro), Mobile Apps (Expo/React Native/Flutter/ADB), and 3D/WebGL Apps."
 readme = "README.md"
 license = { text = "MIT" }
@@ -20,6 +20,9 @@ brain-autopilot = "brain_autopilot.cli:main"
 [tool.setuptools.packages.find]
 include = ["brain_autopilot*"]
 namespaces = false
+
+[tool.setuptools.package-data]
+brain_autopilot = ["workflows/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

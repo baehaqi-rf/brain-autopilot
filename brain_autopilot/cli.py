@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
-from pathlib import Path
 
-from . import __version__, codex, mcp, memory, runtime
+from . import __version__, bench, codex, detectors, mcp, memory, regress, runtime
 from .engines import detect_engine
 from .kit import App
 
@@ -42,6 +42,22 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--url", default=None, help="Live app base URL")
     p_run.add_argument("--seconds", type=float, default=30.0, help="Episode duration in seconds")
     p_run.add_argument("--no-restart", action="store_true", help="Continue without restarting app state")
+
+    p_reg = sub.add_parser("regress", help="Replay saved deterministic regressions for a project")
+    p_reg.add_argument("project_root", nargs="?", default=".")
+    p_reg.add_argument("--id", default=None, help="Replay only a specific regression ID")
+    p_reg.add_argument("--url", default=None, help="Live app base URL")
+    p_reg.add_argument("--frozen-lib", action="store_true", help="Use regression snapshot lib.py instead of live lib.py")
+
+    p_det = sub.add_parser("detectors", help="Inspect or configure bug detectors (detectors.json)")
+    p_det.add_argument("project_root", nargs="?", default=".")
+    p_det.add_argument("--mute", default=None, help="Add detector name or signature to mute list")
+    p_det.add_argument("--unmute", default=None, help="Remove detector name or signature from mute list")
+    p_det.add_argument("--enable", action="store_true", help="Enable detectors")
+    p_det.add_argument("--disable", action="store_true", help="Disable detectors")
+
+    p_bench = sub.add_parser("bench", help="Run the built-in Web/Mobile/3D benchmark suite")
+    p_bench.add_argument("--offline", action="store_true", help="Force offline mode without launching Chrome/Edge CDP")
 
     sub.add_parser("mcp", help="Start the stdio MCP server for Google Antigravity / Claude Code / Codex")
 
@@ -80,15 +96,51 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"memory_dir": mem_dir, "state": st}, indent=2))
         return 0
 
+    if args.cmd == "detectors":
+        mem_dir = codex.project_memory_dir(args.project_root)
+        memory.ensure_scaffold(mem_dir)
+        if args.enable:
+            detectors.set_enabled(mem_dir, True)
+        if args.disable:
+            detectors.set_enabled(mem_dir, False)
+        if args.mute:
+            detectors.mute(mem_dir, args.mute)
+        if args.unmute:
+            detectors.unmute(mem_dir, args.unmute)
+        print(json.dumps({"memory_dir": mem_dir, "config": detectors.config(mem_dir)}, indent=2))
+        return 0
+
+    if args.cmd == "regress":
+        mem_dir = codex.project_memory_dir(args.project_root)
+        base_folder = regress.folder(args.project_root, mem_dir)
+        reg_dirs = [os.path.join(base_folder, args.id)] if args.id else regress.listing(base_folder)
+        summary = regress.replay_all(
+            args.project_root,
+            reg_dirs=reg_dirs,
+            base_url=args.url,
+            mem_dir=mem_dir,
+            frozen_lib=args.frozen_lib,
+        )
+        print(json.dumps(summary, indent=2))
+        return 0 if summary["passed"] == summary["total"] else 1
+
+    if args.cmd == "bench":
+        summary = bench.run_benchmark(live_browser=False if args.offline else "auto")
+        print(json.dumps(summary, indent=2))
+        return 0 if summary["score"] == summary["total"] else 1
+
     if args.cmd == "check":
         engine = detect_engine(args.project)
         if args.url:
             engine.base_url = args.url.rstrip("/")
         app = App(engine, mode="probe")
         mem_dir = codex.project_memory_dir(args.project)
-        res = runtime.check_harness(args.harness, app, extra_sys_path=mem_dir)
-        print(json.dumps(res, indent=2))
-        return 0
+        try:
+            res = runtime.check_harness(args.harness, app, extra_sys_path=mem_dir)
+            print(json.dumps(res, indent=2))
+            return 0
+        finally:
+            app.close()
 
     if args.cmd == "run":
         engine = detect_engine(args.project)
@@ -96,15 +148,19 @@ def main(argv: list[str] | None = None) -> int:
             engine.base_url = args.url.rstrip("/")
         app = App(engine, mode="episode")
         mem_dir = codex.project_memory_dir(args.project)
-        res = runtime.run_harness(
-            args.harness,
-            app,
-            seconds=args.seconds,
-            restart=not args.no_restart,
-            extra_sys_path=mem_dir,
-        )
-        print(json.dumps(res, indent=2))
-        return 0 if res["state"] != "failed" else 1
+        try:
+            res = runtime.run_harness(
+                args.harness,
+                app,
+                seconds=args.seconds,
+                restart=not args.no_restart,
+                extra_sys_path=mem_dir,
+                mem_dir=mem_dir,
+            )
+            print(json.dumps(res, indent=2))
+            return 0 if res["state"] != "failed" else 1
+        finally:
+            app.close()
 
     parser.print_help()
     return 0

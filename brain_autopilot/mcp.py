@@ -1,10 +1,12 @@
 """Stdio MCP Server (`brain-autopilot mcp`) for Google Antigravity, Claude Code, and Codex.
 
-Replicates and generalizes `ramenvr/autopilot/autopilot/mcp.py`:
-- Exposes `start_run`, `wait`, `probe`, `check_harness`, `run_harness`, `snapshot`, `describe_frames`,
-  `codex_diff`, and `report`.
-- Long-running tool calls return `"still going"` after `WAIT_SECONDS` so IDE clients never time out;
-  calling `wait` retrieves the completed result.
+Upgraded v2.0 capabilities:
+- Exposes `start_run`, `wait`, `probe`, `check_harness`, `run_harness`, `snapshot`,
+  `describe_frames`, `codex_diff`, `regress`, `detectors`, and `report`.
+- Automatically wires `vision.Frames` recording via `App(on_frame=...)`.
+- Injects kind-specific `workflows` and project `detectors.json` config into `start_run`.
+- Saves `harnessN.py`, `traceN.jsonl`, and `traceN_summary.txt`, auto-saves `CONFIRMED`
+  regressions on `report`, and redacts secrets/host paths via `Redactor`.
 """
 
 from __future__ import annotations
@@ -13,16 +15,18 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
-from . import __version__, codex, memory, runtime, vision
+from . import __version__, codex, detectors, memory, regress, runtime, vision, workflows
 from .engines import detect_engine
 from .kit import App
 from .kit import control as kit_control
+from .redact import Redactor
 
 PROTOCOL = "2025-06-18"
 WAIT_SECONDS = float(os.environ.get("BRAIN_AUTOPILOT_MCP_WAIT") or 40.0)
@@ -30,16 +34,15 @@ WAIT_SECONDS = float(os.environ.get("BRAIN_AUTOPILOT_MCP_WAIT") or 40.0)
 INSTRUCTIONS = (
     "Brain Autopilot verifies, explores, and playtests Web Apps (Next.js/React/Astro), Mobile Apps (Expo/Flutter/ADB), "
     "and 3D/WebGL Apps. Call `start_run` first with the user's request and `kind` (`verify`, `goal`, or `explore`), "
-    "probe assumptions with `probe`, write `<run_dir>/harness.py`, dry-run with `check_harness`, execute with "
-    "`run_harness`, and finish with `report`."
+    "follow the returned Active Workflow, probe assumptions with `probe`, write `<run_dir>/harness.py`, dry-run with "
+    "`check_harness`, execute with `run_harness`, inspect `traceN_summary.txt` / `describe_frames`, and finish with `report`."
 )
 
 TOOL_SPECS: list[tuple[str, str, dict[str, Any], bool]] = [
     (
         "start_run",
         "Start a Brain Autopilot run on a Web, Mobile, or 3D project. Indexes the project codex, computes SHA-256 "
-        "changes since the last run, initializes project memory (`notes.md`, `lib.py`, `runs/<run_id>/`), and returns "
-        "the briefing.",
+        "changes since the last run, loads the active workflow & bug detectors, initializes project memory, and returns the briefing.",
         {
             "type": "object",
             "properties": {
@@ -99,7 +102,7 @@ TOOL_SPECS: list[tuple[str, str, dict[str, Any], bool]] = [
     ),
     (
         "snapshot",
-        "Return current route, visible screen texts, interactive UI elements, console errors, network errors, and metrics.",
+        "Return current route, visible screen texts, interactive UI elements, console errors, network errors, metrics, and detector findings.",
         {"type": "object", "properties": {}},
         True,
     ),
@@ -127,6 +130,36 @@ TOOL_SPECS: list[tuple[str, str, dict[str, Any], bool]] = [
             "required": ["project_root"],
         },
         True,
+    ),
+    (
+        "regress",
+        "Replay saved deterministic CONFIRMED regressions for a project without calling an LLM.",
+        {
+            "type": "object",
+            "properties": {
+                "project_root": {"type": "string"},
+                "id": {"type": "string", "description": "Optional single regression ID to replay"},
+                "base_url": {"type": "string"},
+                "frozen_lib": {"type": "boolean"},
+            },
+            "required": ["project_root"],
+        },
+        False,
+    ),
+    (
+        "detectors",
+        "Read or update `<memory_dir>/detectors.json` (mute/unmute signatures or toggle detectors enabled).",
+        {
+            "type": "object",
+            "properties": {
+                "project_root": {"type": "string"},
+                "mute": {"type": "string"},
+                "unmute": {"type": "string"},
+                "enabled": {"type": "boolean"},
+            },
+            "required": ["project_root"],
+        },
+        False,
     ),
     (
         "report",
@@ -174,15 +207,20 @@ class ActiveSession:
         self.engine = detect_engine(self.project_root)
         if base_url:
             self.engine.base_url = base_url.rstrip("/")
-        self.app = App(self.engine, mode="probe")
+        self.frames = vision.Frames()
+        self.app = App(
+            self.engine,
+            mode="probe",
+            on_frame=lambda data, t, label: self.frames.add(data, app_time=t, label=label),
+        )
         self.codex_info = codex.build_codex(self.project_root)
         self.mem_dir = self.codex_info["memory_dir"]
         memory.ensure_scaffold(self.mem_dir)
         self.mem_before = memory.snapshot(self.mem_dir)
+        self.redactor = Redactor(project_root=self.project_root)
         self.run_id = time.strftime("run-%Y%m%d-%H%M%S")
         self.run_dir = os.path.join(self.mem_dir, "runs", self.run_id)
         os.makedirs(self.run_dir, exist_ok=True)
-        self.frames = vision.Frames()
         self.episodes: list[dict[str, Any]] = []
         self.last_progress: dict[str, Any] | None = None
 
@@ -204,6 +242,8 @@ class MCPServer:
 
     def execute_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         if name == "start_run":
+            if self.session is not None:
+                self.session.app.close()
             self.session = ActiveSession(
                 project_root=args["project_root"],
                 request=args["request"],
@@ -211,6 +251,7 @@ class MCPServer:
                 base_url=args.get("base_url"),
             )
             s = self.session
+            reg_count = len(regress.listing(regress.folder(s.project_root, s.mem_dir)))
             briefing = {
                 "run_id": s.run_id,
                 "run_dir": s.run_dir,
@@ -220,6 +261,9 @@ class MCPServer:
                 "harness_target": os.path.join(s.run_dir, "harness.py"),
                 "notes_file": os.path.join(s.mem_dir, "notes.md"),
                 "lib_file": os.path.join(s.mem_dir, "lib.py"),
+                "detectors": detectors.config(s.mem_dir),
+                "regressions_count": reg_count,
+                "workflow": workflows.text(s.kind, s.mem_dir),
             }
             return _text(f"Brain Autopilot run {s.run_id} initialized.\n" + json.dumps(briefing, indent=2))
 
@@ -227,19 +271,50 @@ class MCPServer:
             info = codex.build_codex(args["project_root"], update_seen=False)
             return _text(json.dumps(info["diff"], indent=2))
 
+        if name == "detectors":
+            mem_dir = codex.project_memory_dir(args["project_root"])
+            memory.ensure_scaffold(mem_dir)
+            if "enabled" in args:
+                detectors.set_enabled(mem_dir, bool(args["enabled"]))
+            if args.get("mute"):
+                detectors.mute(mem_dir, str(args["mute"]))
+            if args.get("unmute"):
+                detectors.unmute(mem_dir, str(args["unmute"]))
+            return _text(json.dumps(detectors.config(mem_dir), indent=2))
+
+        if name == "regress":
+            mem_dir = codex.project_memory_dir(args["project_root"])
+            base_folder = regress.folder(args["project_root"], mem_dir)
+            reg_dirs = (
+                [os.path.join(base_folder, str(args["id"]))]
+                if args.get("id")
+                else regress.listing(base_folder)
+            )
+            summary = regress.replay_all(
+                args["project_root"],
+                reg_dirs=reg_dirs,
+                base_url=args.get("base_url"),
+                mem_dir=mem_dir,
+                frozen_lib=bool(args.get("frozen_lib", False)),
+            )
+            return _text(json.dumps(summary, indent=2))
+
         if self.session is None:
             return _text("No active run. Call `start_run` first.", error=True)
 
         s = self.session
         if name == "snapshot":
-            snap = {
-                "route": s.app.route(),
-                "screen": s.app.screen(),
-                "ui": s.app.ui(),
-                "console_errors": s.app.console_errors(),
-                "network_errors": s.app.network_errors(),
-                "metrics": s.app.metrics(),
-            }
+            snap = s.redactor.data(
+                {
+                    "route": s.app.route(),
+                    "screen": s.app.screen(),
+                    "ui": s.app.ui(),
+                    "console_errors": s.app.console_errors(),
+                    "network_errors": s.app.network_errors(),
+                    "metrics": s.app.metrics(),
+                    "findings": s.app.findings(mem_dir=s.mem_dir),
+                }
+            )
             return _text(json.dumps(snap, indent=2))
 
         if name == "probe":
@@ -251,8 +326,11 @@ class MCPServer:
                 "run": kit_control.run,
                 "wait": kit_control.wait,
                 "until": kit_control.until,
+                "wait_for_settled": kit_control.wait_for_settled,
+                "retry": kit_control.retry,
                 "navigate_to": kit_control.navigate_to,
                 "click_and_wait": kit_control.click_and_wait,
+                "select_option": kit_control.select_option,
                 "fill_form": kit_control.fill_form,
                 "submit_form_idempotent": kit_control.submit_form_idempotent,
                 "scroll_until_visible": kit_control.scroll_until_visible,
@@ -262,8 +340,11 @@ class MCPServer:
                 with contextlib.redirect_stdout(buf):
                     exec(args["code"], scope)  # noqa: S102
             except Exception as exc:  # noqa: BLE001
-                return _text(f"Probe error: {type(exc).__name__}: {exc}\nOutput:\n{buf.getvalue()}", error=True)
-            return _text(buf.getvalue() or "(probe completed with no stdout)")
+                return _text(
+                    s.redactor.text(f"Probe error: {type(exc).__name__}: {exc}\nOutput:\n{buf.getvalue()}"),
+                    error=True,
+                )
+            return _text(s.redactor.text(buf.getvalue()) or "(probe completed with no stdout)")
 
         if name == "check_harness":
             h_path = args.get("harness_path") or os.path.join(s.run_dir, "harness.py")
@@ -273,12 +354,16 @@ class MCPServer:
                 restart=bool(args.get("restart", True)),
                 extra_sys_path=s.mem_dir,
             )
-            return _text(json.dumps(res, indent=2))
+            return _text(json.dumps(s.redactor.data(res), indent=2))
 
         if name == "run_harness":
             h_path = args.get("harness_path") or os.path.join(s.run_dir, "harness.py")
             ep_num = len(s.episodes) + 1
+            ep_harness = os.path.join(s.run_dir, f"harness{ep_num}.py")
+            if os.path.isfile(h_path) and os.path.abspath(h_path) != os.path.abspath(ep_harness):
+                shutil.copyfile(h_path, ep_harness)
             trace_file = os.path.join(s.run_dir, f"trace{ep_num}.jsonl")
+            summary_file = os.path.join(s.run_dir, f"trace{ep_num}_summary.txt")
             restart = bool(args.get("restart", True))
             res = runtime.run_harness(
                 h_path,
@@ -287,15 +372,20 @@ class MCPServer:
                 restart=restart,
                 progress_in=None if restart else s.last_progress,
                 trace_path=trace_file,
+                summary_path=summary_file,
                 extra_sys_path=s.mem_dir,
+                mem_dir=s.mem_dir,
+                redactor=s.redactor,
             )
+            res["trace_summary"] = summary_file
             s.episodes.append(res)
             s.last_progress = res["progress"]
             return _text(json.dumps(res, indent=2))
 
         if name == "describe_frames":
             selected = s.frames.select(start=args.get("start"), end=args.get("end"))
-            payload = vision.build_blind_vision_payload(args["questions"], selected)
+            cleaned_q = [s.redactor.text(str(q)) for q in args["questions"]]
+            payload = vision.build_blind_vision_payload(cleaned_q, selected)
             return _text(json.dumps(payload, indent=2))
 
         if name == "report":
@@ -303,14 +393,20 @@ class MCPServer:
             if not ok:
                 return _text(msg, error=True)
             mem_learned = memory.learned(s.mem_dir, s.mem_before, s.run_id)
-            report_data = {
-                **args,
-                "run_id": s.run_id,
-                "episodes": len(s.episodes),
-                "memory_learned": mem_learned,
-                "probe_direct_writes": [w for w in s.app.direct_writes if w.get("mode") == "probe"],
-                "episode_direct_writes": [w for w in s.app.direct_writes if w.get("mode") == "episode"],
-            }
+            report_data = s.redactor.data(
+                {
+                    **args,
+                    "run_id": s.run_id,
+                    "request": s.request,
+                    "episodes": len(s.episodes),
+                    "memory_learned": mem_learned,
+                    "probe_direct_writes": [w for w in s.app.direct_writes if w.get("mode") == "probe"],
+                    "episode_direct_writes": [w for w in s.app.direct_writes if w.get("mode") == "episode"],
+                }
+            )
+            reg_path = regress.save(s.run_dir, report_data, s.project_root, mem_dir=s.mem_dir)
+            if reg_path:
+                report_data["regression_saved"] = s.redactor.text(reg_path)
             report_file = os.path.join(s.run_dir, "report.json")
             with open(report_file, "w", encoding="utf-8") as fh:
                 json.dump(report_data, fh, indent=2)
@@ -380,16 +476,20 @@ class MCPServer:
             self.send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"No method {method}"}})
 
     def serve(self, lines: Any) -> None:
-        for line in lines:
-            raw = line.strip()
-            if not raw:
-                continue
-            try:
-                msg = json.loads(raw)
-            except ValueError:
-                continue
-            if isinstance(msg, dict):
-                self.handle(msg)
+        try:
+            for line in lines:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    msg = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(msg, dict):
+                    self.handle(msg)
+        finally:
+            if self.session is not None:
+                self.session.app.close()
 
 
 def serve_stdio() -> int:

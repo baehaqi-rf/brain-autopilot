@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 import time
 from typing import Any
 
@@ -20,6 +21,24 @@ NOTES = ("notes.md", "lib.py")
 LEARNED = ("notes.md", "lib.py", "runs")
 RESET_BACKUP = ".reset-backup"
 RESET_MARK = ".memory-reset.json"
+
+
+def write_atomic(path: str, text: str) -> None:
+    """Write `text` to `path` via a unique temp file in the same directory and `os.replace`."""
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".part", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 class InUse(OSError):

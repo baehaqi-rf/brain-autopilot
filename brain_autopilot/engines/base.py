@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 
@@ -14,6 +15,7 @@ class AppEngine:
     def __init__(self, project_root: str | None = None, base_url: str | None = None) -> None:
         self.project_root = project_root or "."
         self.base_url = (base_url or "http://localhost:3000").rstrip("/")
+        self._started_wall = time.monotonic()
         self._route: str = "/"
         self._state: dict[str, dict[str, Any]] = {}
         self._ui_elements: list[dict[str, Any]] = []
@@ -25,8 +27,13 @@ class AppEngine:
             "fps": 60.0,
             "overflow_elements": 0,
             "touch_target_violations": 0,
+            "broken_images": 0,
         }
         self._frames: list[bytes] = []
+
+    def app_time(self) -> float:
+        """Current monotonic application clock in seconds."""
+        return round(time.monotonic() - self._started_wall, 3)
 
     def get_route(self) -> str:
         return self._route
@@ -37,23 +44,39 @@ class AppEngine:
     def get_ui_elements(self) -> list[dict[str, Any]]:
         return [dict(el) for el in self._ui_elements]
 
-    def element_exists(self, selector_or_id: str) -> bool:
+    def _find_ui_element(self, selector_or_id: str) -> dict[str, Any] | None:
+        target = str(selector_or_id or "").strip()
+        if not target:
+            return None
         for el in self._ui_elements:
-            if selector_or_id in (el.get("id"), el.get("selector"), el.get("label"), el.get("test_id")):
-                return True
-        return selector_or_id in self._screen_texts or selector_or_id in self._state
+            if target in (el.get("id"), el.get("selector"), el.get("label"), el.get("test_id")):
+                return el
+        low = target.lower()
+        for el in self._ui_elements:
+            label = str(el.get("label") or "").lower()
+            if label and (label == low or low in label):
+                return el
+        return None
+
+    def element_exists(self, selector_or_id: str) -> bool:
+        if self._find_ui_element(selector_or_id) is not None:
+            return True
+        if selector_or_id in self._screen_texts or selector_or_id in self._state:
+            return True
+        low = str(selector_or_id or "").strip().lower()
+        return bool(low and any(low in txt.lower() for txt in self._screen_texts.values()))
 
     def get_property(self, selector_or_path: str, prop: str = "text") -> Any:
         if selector_or_path in self._state and prop in self._state[selector_or_path]:
             return self._state[selector_or_path][prop]
-        for el in self._ui_elements:
-            if selector_or_path in (el.get("id"), el.get("selector"), el.get("label"), el.get("test_id")):
-                if prop in el:
-                    return el[prop]
-                if prop == "disabled":
-                    return not bool(el.get("enabled", True))
-                if prop == "text":
-                    return el.get("label", "")
+        el = self._find_ui_element(selector_or_path)
+        if el is not None:
+            if prop in el:
+                return el[prop]
+            if prop == "disabled":
+                return not bool(el.get("enabled", True))
+            if prop == "text":
+                return el.get("label", "")
         if prop == "text" and selector_or_path in self._screen_texts:
             return self._screen_texts[selector_or_path]
         return None
@@ -76,21 +99,24 @@ class AppEngine:
         return True
 
     def act_on_ui(self, id_or_selector: str, action: str = "click", value: Any = None) -> bool:
-        for el in self._ui_elements:
-            if id_or_selector in (el.get("id"), el.get("selector"), el.get("label"), el.get("test_id")):
-                if not el.get("enabled", True) and action in ("click", "submit", "tap"):
-                    return False
-                if action in ("fill", "set"):
-                    el["value"] = str(value or "")
-                elif action in ("click", "tap", "submit"):
-                    el["clicked"] = int(el.get("clicked") or 0) + 1
-                return True
-        return False
+        el = self._find_ui_element(id_or_selector)
+        if el is None:
+            return False
+        if not el.get("enabled", True) and action in ("click", "submit", "tap"):
+            return False
+        if action in ("fill", "set", "select"):
+            el["value"] = str(value or "")
+        elif action in ("click", "tap", "submit"):
+            el["clicked"] = int(el.get("clicked") or 0) + 1
+        return True
 
     def press_key(self, key: str) -> bool:
         return bool(key)
 
     def scroll(self, dx: int = 0, dy: int = 400) -> bool:
+        return True
+
+    def wait_settled(self, timeout: float = 2.0) -> bool:
         return True
 
     def capture_frame(self, label: str = "") -> bytes | None:
@@ -106,3 +132,6 @@ class AppEngine:
     def set_state_direct(self, path: str, prop: str, value: Any, why: str = "") -> bool:
         self._state.setdefault(path, {})[prop] = value
         return True
+
+    def close(self) -> None:
+        """Release any browser or device resources held by this engine."""

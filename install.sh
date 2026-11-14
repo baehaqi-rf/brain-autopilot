@@ -27,8 +27,8 @@ ln -s "$SRC_SKILL" "$TGT_SKILL"
 echo "Linked skill: $TGT_SKILL -> $SRC_SKILL"
 
 mkdir -p "$TGT_AGENTS"
-cp "$REPO_DIR/agents/brain-autopilot.md" "$TGT_AGENTS/"
-echo "Installed agent: $TGT_AGENTS/brain-autopilot.md"
+cp "$REPO_DIR/agents/"*.md "$TGT_AGENTS/"
+echo "Installed agents in: $TGT_AGENTS"
 
 python3 -m pip install -e "$REPO_DIR" --quiet || true
 

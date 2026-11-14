@@ -6,27 +6,30 @@
 
 ## 1. Live Application Bridge (`app`)
 
-### Privileged Reads
+### Privileged Reads & Clock
 - `app.route() -> str`: current URL path or mobile screen route.
 - `app.screen() -> dict[str, str]`: visible text blocks currently rendered on screen.
 - `app.ui() -> list[dict]`: interactive controls currently on screen:
-  `[{"id", "selector", "test_id", "kind", "label", "enabled", "value", "bounds"}]`.
-- `app.exists(selector_or_id) -> bool`: whether the target element is currently rendered.
+  `[{"id", "selector", "test_id", "kind", "role", "label", "enabled", "visible", "value", "bounds", "touch_target_ok"}]`.
+- `app.exists(selector_or_id) -> bool`: whether the target element or text is currently rendered.
 - `app.get(selector_or_path, prop="text") -> Any`: read `"text"`, `"value"`, `"disabled"`, `"bounds"`, or state property.
-- `app.console_errors() -> list[str]`: uncaught exceptions, React hydration mismatches, or `logcat *:E` errors.
+- `app.console_errors() -> list[str]`: uncaught JS exceptions, console errors, or Android `logcat *:E` errors.
 - `app.network_errors() -> list[dict]`: HTTP `4xx`/`5xx` or failed network requests during the episode.
-- `app.metrics() -> dict`: `{"cls", "fps", "overflow_elements", "touch_target_violations", "scene_objects"}`.
-- `app.batch([lambda: ..., lambda: ...]) -> list`: execute multiple reads in a single logical step.
+- `app.metrics() -> dict`: `{"cls", "fps", "overflow_elements", "touch_target_violations", "broken_images", "draw_calls", "triangles", "canvas_present", "canvas_blank", "webgl_errors"}`.
+- `app.findings(mem_dir=None) -> list[dict]`: evaluate active bug detectors (respecting `detectors.json` mute rules).
+- `app.clock() -> AppClock`: app/render-clock stopwatch (`elapsed()`, `step()`, `since()`).
+- `app.batch([lambda: ..., lambda: ...]) -> list`: execute multiple reads in one logical step.
 
 ### User Inputs (The Only Way to Act in Episodes)
-- `app.navigate(route_or_url) -> bool`: navigate to a route or URL.
-- `app.click(selector) -> bool`: click or tap an interactive element.
-- `app.fill(selector, text) -> bool`: fill text into an input or textarea.
-- `app.ui_act(id, action="click"|"fill"|"submit"|"tap", value=..., text=...) -> bool`: act on an item from `app.ui()`.
+- `app.navigate(route_or_url) -> bool`: navigate to a route, URL, or Android deep link.
+- `app.click(selector) -> bool`: click or tap an interactive element (by CSS selector, `#id`, `data-testid`, `aria-label`, or visible text).
+- `app.fill(selector, text) -> bool`: fill text into an input or textarea (React/Vue controlled-input safe over CDP; `adb input text` on Android).
+- `app.ui_act(id, action="click"|"fill"|"select"|"submit"|"tap", value=..., text=...) -> bool`: act on an item from `app.ui()`.
 - `app.press(key) -> bool`: press keyboard or mobile key (`"Enter"`, `"Escape"`, `"Tab"`, `"BACK"`).
-- `app.scroll(dx=0, dy=400) -> bool`: scroll viewport or active list container.
-- `app.screenshot(label="") -> bytes | None`: capture a PNG frame for `describe_frames`.
-- `app.restart(route=None) -> bool`: reset session to initial state.
+- `app.scroll(dx=0, dy=400) -> bool`: scroll viewport or swipe mobile screen.
+- `app.wait_settled(timeout=2.0) -> bool`: wait for DOM/UI stability.
+- `app.screenshot(label="") -> bytes | None`: capture a PNG frame (automatically recorded into `vision.Frames`).
+- `app.restart(route=None) -> bool`: reset session (`localStorage`/`sessionStorage` + route).
 
 ### Research State Override (Tracked for Anti-Cheat)
 - `app.set(path, prop, value, why="...")`: directly writes state. Requires a non-empty `why`. Listed separately in reports (`probe_direct_writes` vs `episode_direct_writes`).
@@ -35,14 +38,17 @@
 
 ## 2. Generator Controllers (`brain_autopilot.kit.control`)
 
-Use `yield from` inside option executors (`Option.run`), or drive synchronously via `run(gen, timeout=15)` in `setup()` / `probe`:
+Use `yield from` inside `Option.run`, or drive synchronously via `run(gen, timeout=15)` in `setup()` / `probe`:
 
 - `navigate_to(app, route, timeout=10)`
 - `click_and_wait(app, selector, expect=lambda: ..., timeout=8)`
+- `select_option(app, selector, value)`
 - `fill_form(app, fields={"#email": "...", "#password": "..."}, submit_selector="#submit")`
 - `submit_form_idempotent(app, submit_selector, timeout=10)`: clicks submit, tests rapid double-click idempotency (`disabled` in-flight), and verifies zero network errors.
 - `scroll_until_visible(app, selector, max_scrolls=8, dy=450)`
 - `verify_four_states(app, selectors={"loading": ..., "empty": ..., "error": ..., "success": ...})`
+- `wait_for_settled(app, timeout=2.0)`
+- `retry(app, make_gen, attempts=3, pause=0.2)`
 - `until(app, predicate, timeout=10, description="...")`
 - `wait(app, seconds)`
 
@@ -75,11 +81,12 @@ class CheckoutVerificationHarness(Harness):
         ]
 
     def observe(self, app):
-        route, ui_items, errs, net_errs = app.batch([
+        route, ui_items, errs, net_errs, findings = app.batch([
             lambda: app.route(),
             lambda: app.ui(),
             lambda: app.console_errors(),
             lambda: app.network_errors(),
+            lambda: app.findings(),
         ])
         return {
             "route": route,
@@ -88,6 +95,7 @@ class CheckoutVerificationHarness(Harness):
             "order_confirmed": app.exists("[data-testid='order-confirmed']"),
             "console_errors": len(errs),
             "network_errors": len(net_errs),
+            "findings_count": len(findings),
         }
 
     def options(self, obs):

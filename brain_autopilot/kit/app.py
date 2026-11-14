@@ -1,18 +1,20 @@
 """Live Application Bridge (`app`): unified API over Web (CDP/Browser), Mobile (ADB/Expo/Flutter), and 3D (WebGL).
 
 Replicates and generalizes `ramenvr/autopilot/autopilot/kit/game.py`:
-- Privileged reads (`app.route()`, `app.screen()`, `app.ui()`, `app.state(path)`, `app.console_errors()`,
-  `app.network_errors()`, `app.metrics()`, `app.batch([...])`).
-- Authentic user inputs (`app.click()`, `app.fill()`, `app.press()`, `app.scroll()`, `app.tap()`, `app.swipe()`,
-  `app.ui_act()`, `app.navigate()`).
-- Research-only direct state writes (`app.set(path, value, why=...)`) which are tracked separately so
-  verification episodes (`run_harness`) remain 100% honest and free of reward hacking.
+- Privileged reads (`app.route()`, `app.screen()`, `app.ui()`, `app.get()`, `app.console_errors()`,
+  `app.network_errors()`, `app.metrics()`, `app.findings()`, `app.batch([...])`).
+- Authentic user inputs (`app.click()`, `app.fill()`, `app.press()`, `app.scroll()`, `app.ui_act()`,
+  `app.navigate()`, `app.wait_settled()`).
+- Automatic frame recording hook (`on_frame`) feeding `vision.Frames`.
+- Research-only direct state writes (`app.set(path, prop, value, why=...)`) tracked for anti-cheat audit.
 """
 
 from __future__ import annotations
 
 import time
 from typing import Any, Callable
+
+from .clock import AppClock
 
 
 class AppError(RuntimeError):
@@ -22,17 +24,31 @@ class AppError(RuntimeError):
 class App:
     """Unified live application interface passed to `Harness` and `probe`."""
 
-    def __init__(self, engine: Any, mode: str = "episode") -> None:
+    def __init__(
+        self,
+        engine: Any,
+        mode: str = "episode",
+        on_frame: Callable[[bytes, float, str], None] | None = None,
+    ) -> None:
         self.engine = engine
         self.mode = mode  # "probe" or "episode"
+        self.on_frame = on_frame
         self.t: float = 0.0
         self._started = time.monotonic()
         self.direct_writes: list[dict[str, Any]] = []
         self.action_log: list[dict[str, Any]] = []
 
     def _tick_time(self) -> float:
-        self.t = round(time.monotonic() - self._started, 3)
+        fn = getattr(self.engine, "app_time", None)
+        if callable(fn):
+            self.t = float(fn())
+        else:
+            self.t = round(time.monotonic() - self._started, 3)
         return self.t
+
+    def clock(self) -> AppClock:
+        """Create an `AppClock` stopwatch tied to this app's clock."""
+        return AppClock(self)
 
     # -- Privileged Reads ---------------------------------------------------------------------------------
 
@@ -47,14 +63,12 @@ class App:
         return self.engine.get_screen_texts()
 
     def ui(self) -> list[dict[str, Any]]:
-        """Interactive UI elements currently on screen:
-        `[{"id", "kind", "label", "selector", "enabled", "bounds", "value"}]`.
-        """
+        """Interactive UI elements currently on screen."""
         self._tick_time()
         return self.engine.get_ui_elements()
 
     def exists(self, selector_or_id: str) -> bool:
-        """Whether an element or actor matching `selector_or_id` is currently rendered."""
+        """Whether an element or text matching `selector_or_id` is currently rendered."""
         self._tick_time()
         return self.engine.element_exists(selector_or_id)
 
@@ -74,9 +88,16 @@ class App:
         return list(self.engine.get_network_errors())
 
     def metrics(self) -> dict[str, Any]:
-        """Layout & runtime telemetry: `{"cls", "fps", "overflow_elements", "touch_target_violations", "scene_objects"}`."""
+        """Layout & runtime telemetry (`cls`, `fps`, `overflow_elements`, `touch_target_violations`, etc.)."""
         self._tick_time()
         return self.engine.get_metrics()
+
+    def findings(self, mem_dir: str | None = None) -> list[dict[str, Any]]:
+        """Evaluate bug detectors on current live telemetry (respecting `detectors.json` mute rules)."""
+        from .. import detectors
+
+        self._tick_time()
+        return detectors.evaluate(self, folder=mem_dir)
 
     def batch(self, fns: list[Callable[[], Any]]) -> list[Any]:
         """Execute multiple reads in one logical step, returning `AppError` instances for any that fail."""
@@ -108,7 +129,7 @@ class App:
         value: Any = None,
         text: str | None = None,
     ) -> bool:
-        """Act on an interactive element returned by `app.ui()` (`click`, `fill`, `select`, `submit`, `tap`)."""
+        """Act on an interactive element (`click`, `fill`, `select`, `submit`, `tap`)."""
         self._tick_time()
         payload = text if text is not None else value
         self.action_log.append({"t": self.t, "action": action, "id": id, "value": payload})
@@ -134,10 +155,19 @@ class App:
         self.action_log.append({"t": self.t, "action": "scroll", "dx": dx, "dy": dy})
         return self.engine.scroll(dx, dy)
 
-    def screenshot(self, label: str = "") -> bytes | None:
-        """Capture current viewport/device frame as PNG/JPEG bytes."""
+    def wait_settled(self, timeout: float = 2.0) -> bool:
+        """Wait until DOM/UI layout settles."""
         self._tick_time()
-        return self.engine.capture_frame(label=label)
+        fn = getattr(self.engine, "wait_settled", None)
+        return fn(timeout=timeout) if callable(fn) else True
+
+    def screenshot(self, label: str = "") -> bytes | None:
+        """Capture current viewport/device frame as PNG/JPEG bytes and forward to `on_frame` if set."""
+        self._tick_time()
+        data = self.engine.capture_frame(label=label)
+        if data and callable(self.on_frame):
+            self.on_frame(data, self.t, label)
+        return data
 
     def restart(self, route: str | None = None) -> bool:
         """Reset app session to initial state (or `route`)."""
@@ -145,14 +175,16 @@ class App:
         self.action_log.append({"t": self.t, "action": "restart", "route": route})
         return self.engine.restart(route=route)
 
+    def close(self) -> None:
+        """Release underlying browser/device resources."""
+        fn = getattr(self.engine, "close", None)
+        if callable(fn):
+            fn()
+
     # -- Direct State Manipulation (Tracked for Anti-Cheat Auditing) --------------------------------------
 
     def set(self, path: str, prop: str, value: Any, why: str = "") -> bool:
-        """Directly mutate storage/state (`localStorage`, mock store, or debug hook).
-
-        In `probe` mode this is normal research. In `episode` (`run_harness`) mode it is recorded as an
-        episode state override and flagged unless `why` justifies removing an unrelated blocker.
-        """
+        """Directly mutate storage/state (`localStorage`, mock store, or debug hook)."""
         if not why:
             raise AppError("app.set() requires a non-empty `why` explanation for audit traceability.")
         self._tick_time()

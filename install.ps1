@@ -85,10 +85,12 @@ if ($needLink) {
     Write-Host "Linked skill: $tgtSkill -> $srcSkill" -ForegroundColor Green
 }
 
-# --- 2. Agent: thin wrapper ----------------------------------------------------
+# --- 2. Agents: thin wrappers --------------------------------------------------
 New-Item -ItemType Directory -Force -Path $tgtAgents | Out-Null
-Copy-Item -Force $srcAgent $tgtAgents
-Write-Host "Installed agent: $(Join-Path $tgtAgents 'brain-autopilot.md')" -ForegroundColor Green
+Get-ChildItem -Path (Join-Path $repoDir "agents") -Filter "*.md" | ForEach-Object {
+    Copy-Item -Force $_.FullName $tgtAgents
+    Write-Host "Installed agent: $(Join-Path $tgtAgents $_.Name)" -ForegroundColor Green
+}
 
 # --- 3. Editable Python package install ----------------------------------------
 if (-not $SkipPip) {

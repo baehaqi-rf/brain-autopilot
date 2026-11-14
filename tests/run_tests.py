@@ -15,10 +15,11 @@ sys.path.insert(0, str(ROOT / "tests"))
 import test_codex_and_memory  # noqa: E402
 import test_engines_and_mcp  # noqa: E402
 import test_harness_and_runtime  # noqa: E402
+import test_v2_upgrades  # noqa: E402
 
 
 def main() -> int:
-    modules = [test_codex_and_memory, test_harness_and_runtime, test_engines_and_mcp]
+    modules = [test_codex_and_memory, test_harness_and_runtime, test_engines_and_mcp, test_v2_upgrades]
     passed = 0
     failed = 0
     for mod in modules:

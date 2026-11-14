@@ -94,12 +94,17 @@ class Harness:
     plan: list[Step] = []
     stall_seconds: float = 45.0
     step_seconds: float = 120.0
+    watch_questions: dict[str, Any] = {}
+    watch_every: float = 8.0
 
     def setup(self, app: Any) -> None:
         """Run once before the episode begins (navigate to start_route, calibrate viewport/device)."""
 
     def resume(self, app: Any, progress: dict[str, Any]) -> None:
         """Called after `setup()` when `run_harness(restart=False)` continues from a stalled/paused state."""
+
+    def on_watch(self, answers: dict[str, Any], obs: dict[str, Any]) -> None:
+        """Optional callback invoked with visual watch observations during an episode."""
 
     def observe(self, app: Any) -> dict[str, Any]:
         """Read live app state every tick. Prefix private/raw keys with `_` to hide from decision summaries."""
