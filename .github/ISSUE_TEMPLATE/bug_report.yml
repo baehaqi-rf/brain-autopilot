@@ -1,0 +1,50 @@
+name: Bug Report
+description: Report a bug or unexpected behavior in Brain Autopilot
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out the details below.
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug
+      description: A clear and concise description of what the bug is.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Minimal command, harness, or steps to reproduce the behavior.
+      placeholder: |
+        1. Run `brain-autopilot ...`
+        2. Observe error ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, and target platform (Web CDP / Android ADB / WebGL).
+      placeholder: |
+        - OS: Windows 11 / Ubuntu 24.04 / macOS
+        - Python: 3.12
+        - Version: 2.0.0
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or trace output
+      description: Paste any relevant error logs or redacted trace output.
+      render: shell

@@ -1,6 +1,7 @@
 # Brain Autopilot (`brain-autopilot`)
 
 [![Google Antigravity](https://img.shields.io/badge/Google%20Antigravity-Agent%20%26%20Skill%20%2B%20MCP-blue.svg)](https://antigravity.google)
+[![CI](https://github.com/baehaqi-rf/brain-autopilot/actions/workflows/ci.yml/badge.svg)](https://github.com/baehaqi-rf/brain-autopilot/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/badge/Version-2.0.0-emerald.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
 
@@ -89,6 +90,14 @@ python tests/run_tests.py
 python tests/validate_repo.py
 python bench/run_bench.py
 ```
+
+---
+
+## Contributing
+
+Contributions are welcome! Please read the [Contributing Guide](CONTRIBUTING.md) before opening a pull request, and adhere to our [Code of Conduct](CODE_OF_CONDUCT.md).
+
+For security issues, please follow our [Security Policy](SECURITY.md).
 
 ---
 
