@@ -416,12 +416,14 @@ class CDPSession:
             f"--window-size={w},{h}",
             "about:blank",
         ]
-        if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0:
-            cmd.insert(1, "--no-sandbox")
+        if os.name != "nt":
+            cmd.insert(1, "--disable-dev-shm-usage")
+            if (hasattr(os, "geteuid") and os.geteuid() == 0) or os.environ.get("CI"):
+                cmd.insert(1, "--no-sandbox")
 
         self._proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         port: int | None = None
-        deadline = time.monotonic() + 12.0
+        deadline = time.monotonic() + 25.0
         assert self._proc.stderr is not None
         while time.monotonic() < deadline:
             line = self._proc.stderr.readline().decode("utf-8", errors="replace")
@@ -436,7 +438,7 @@ class CDPSession:
             raise RuntimeError("Timed out waiting for headless browser DevTools port.")
 
         page_ws: str | None = None
-        list_deadline = time.monotonic() + 5.0
+        list_deadline = time.monotonic() + 10.0
         while time.monotonic() < list_deadline and not page_ws:
             try:
                 with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=2) as resp:
