@@ -30,7 +30,7 @@ mkdir -p "$TGT_AGENTS"
 cp "$REPO_DIR/agents/"*.md "$TGT_AGENTS/"
 echo "Installed agents in: $TGT_AGENTS"
 
-python3 -m pip install -e "$REPO_DIR" --quiet || true
+python3 -m pip install -e "$REPO_DIR" --config-settings editable_mode=compat --quiet || python3 -m pip install -e "$REPO_DIR" --quiet || true
 
 [ -f "$TGT_SKILL/SKILL.md" ] || { echo "Self-check failed" >&2; exit 1; }
 echo "Done. Type /brain-autopilot in Google Antigravity."

@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import __version__, codex, detectors, memory, regress, runtime, vision, workflows
+from . import __version__, codex, detectors, doctor, memory, regress, report_html, runtime, vision, workflows
 from .engines import detect_engine
 from .kit import App
 from .kit import control as kit_control
@@ -162,6 +162,17 @@ TOOL_SPECS: list[tuple[str, str, dict[str, Any], bool]] = [
         False,
     ),
     (
+        "doctor",
+        "Diagnose Python environment, IDE/Pyrefly static .pth typing, headless Chrome/Edge CDP, ADB, and Antigravity skill wiring.",
+        {
+            "type": "object",
+            "properties": {
+                "fix": {"type": "boolean", "description": "Auto-repair PEP 660 dynamic editable .pth if detected"},
+            },
+        },
+        True,
+    ),
+    (
         "report",
         "Submit the final verified outcome (`achieved`, `not_achieved`, `CONFIRMED`, `DENIED`, `INCONCLUSIVE`, or "
         "`explored`), summary, and empirical evidence.",
@@ -298,6 +309,10 @@ class MCPServer:
                 frozen_lib=bool(args.get("frozen_lib", False)),
             )
             return _text(json.dumps(summary, indent=2))
+
+        if name == "doctor":
+            diag = doctor.diagnose(fix=bool(args.get("fix", False)))
+            return _text(json.dumps(diag, indent=2))
 
         if self.session is None:
             return _text("No active run. Call `start_run` first.", error=True)

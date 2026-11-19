@@ -68,8 +68,9 @@ class WebGL3DEngine(WebEngine):
         project_root: str | None = None,
         base_url: str | None = None,
         use_cdp: bool | str = "auto",
+        shared_cdp: Any = None,
     ) -> None:
-        super().__init__(project_root=project_root, base_url=base_url, use_cdp=use_cdp)
+        super().__init__(project_root=project_root, base_url=base_url, use_cdp=use_cdp, shared_cdp=shared_cdp)
         self._metrics.update(
             {
                 "fps": 60.0,

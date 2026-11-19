@@ -1,6 +1,6 @@
 {
-  "name": "brain-autopilot-core-v2",
-  "description": "Benchmark suite modeled on ramenvr/autopilot/bench, BU Bench, and Maestro for Web CDP, Bug Detectors, Mobile XML Touch Audit, 3D Canvas, Blind Vision, and Zero-LLM Regression Replay.",
+  "name": "brain-autopilot-core-v3",
+  "description": "v3.0 Benchmark suite covering Live CDP Web, Bug & Accessibility/Performance Detectors, Warm CDP Session Reuse, Mobile XML Touch Audit, 3D Canvas, Blind Vision, Zero-LLM Regression Replay, Doctor Diagnostics, and Self-Contained HTML Reports.",
   "tasks": [
     {
       "id": "W1_checkout_and_regress",
@@ -11,6 +11,16 @@
       "id": "W2_bug_detectors_and_mute",
       "category": "detectors",
       "description": "Catch console_error, 404 network_error, horizontal_overflow, <44px touch_target, broken_image, and test mute rules"
+    },
+    {
+      "id": "W3_a11y_and_perf_detectors",
+      "category": "a11y_and_perf",
+      "description": "Catch WCAG missing alt, unlabeled interactive controls, DOM/LCP telemetry, and mute rules"
+    },
+    {
+      "id": "W4_session_reuse_isolation",
+      "category": "cdp_pool",
+      "description": "Verify warm shared CDPSession.reset_page() clears error/storage state cleanly between runs"
     },
     {
       "id": "M1_mobile_uiautomator_touch_audit",
@@ -26,6 +36,11 @@
       "id": "V1_blind_vision_and_redaction",
       "category": "vision_and_security",
       "description": "Verify blind vision leading-question guard and Redactor credential/path scrubbing"
+    },
+    {
+      "id": "E1_doctor_and_report_html",
+      "category": "dx_and_reporting",
+      "description": "Verify doctor IDE/typing diagnostics and zero-dependency self-contained HTML report generation"
     }
   ]
 }

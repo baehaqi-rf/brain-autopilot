@@ -21,9 +21,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import detectors, memory, regress, runtime, vision
+from . import detectors, doctor, memory, regress, report_html, runtime, vision
 from .engines import MobileEngine, WebEngine, WebGL3DEngine
-from .engines.cdp import find_browser_binary
+from .engines.cdp import CDPSession, find_browser_binary
 from .kit import App, Harness, Option, Result, Status, Step, click_and_wait, fill_form, navigate_to, submit_form_idempotent
 from .redact import Redactor
 
@@ -85,6 +85,14 @@ _APP_HTML: dict[str, str] = {
 <body>
   <canvas id="scene" width="320" height="240" style="width:320px;height:240px;"></canvas>
 </body></html>""",
+    "/a11y-bad": """<!doctype html>
+<html><head><title>A11y Audit</title></head>
+<body>
+  <h1>Accessibility Audit Page</h1>
+  <img src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7" width="32" height="32" />
+  <button id="icon-only" style="min-width:48px;min-height:48px;"></button>
+  <button id="good-btn" style="min-width:120px;min-height:48px;">Accessible Action</button>
+</body></html>""",
 }
 
 
@@ -139,7 +147,7 @@ class _LocalBenchServer:
         self._httpd.server_close()
 
 
-def _bench_w1_checkout_and_regress(base_url: str, live_cdp: bool) -> dict[str, Any]:
+def _bench_w1_checkout_and_regress(base_url: str, live_cdp: bool, shared_cdp: CDPSession | None = None) -> dict[str, Any]:
     t0 = time.monotonic()
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp) / "shop-app"
@@ -235,7 +243,7 @@ class BenchCheckoutHarness(Harness):
         h_path = run_dir / "harness1.py"
         h_path.write_text(harness_code, encoding="utf-8")
 
-        engine = WebEngine(project_root=str(root), base_url=base_url, use_cdp=live_cdp)
+        engine = WebEngine(project_root=str(root), base_url=base_url, use_cdp=live_cdp, shared_cdp=shared_cdp)
         frames = vision.Frames()
         app = App(engine, mode="episode", on_frame=lambda d, ts, lbl: frames.add(d, app_time=ts, label=lbl))
         try:
@@ -263,7 +271,10 @@ class BenchCheckoutHarness(Harness):
             root,
             base_url=base_url,
             mem_dir=mem_dir,
-            app_factory=lambda eng: App(WebEngine(project_root=str(root), base_url=base_url, use_cdp=live_cdp)),
+            shared_cdp=shared_cdp,
+            app_factory=lambda eng: App(
+                WebEngine(project_root=str(root), base_url=base_url, use_cdp=live_cdp, shared_cdp=shared_cdp)
+            ),
         )
         passed = bool(
             ep["state"] == "done"
@@ -284,12 +295,12 @@ class BenchCheckoutHarness(Harness):
         }
 
 
-def _bench_w2_bug_detectors(base_url: str, live_cdp: bool) -> dict[str, Any]:
+def _bench_w2_bug_detectors(base_url: str, live_cdp: bool, shared_cdp: CDPSession | None = None) -> dict[str, Any]:
     t0 = time.monotonic()
     with tempfile.TemporaryDirectory() as tmp:
         mem_dir = Path(tmp) / "mem"
         memory.ensure_scaffold(str(mem_dir))
-        engine = WebEngine(base_url=base_url, use_cdp=live_cdp)
+        engine = WebEngine(base_url=base_url, use_cdp=live_cdp, shared_cdp=shared_cdp)
         app = App(engine, mode="probe")
         try:
             if live_cdp:
@@ -348,9 +359,66 @@ def _bench_m1_mobile_accessibility() -> dict[str, Any]:
     }
 
 
-def _bench_d1_webgl3d_canvas(base_url: str, live_cdp: bool) -> dict[str, Any]:
+def _bench_w3_a11y_and_perf(base_url: str, live_cdp: bool, shared_cdp: CDPSession | None = None) -> dict[str, Any]:
     t0 = time.monotonic()
-    eng = WebGL3DEngine(base_url=base_url, use_cdp=live_cdp)
+    with tempfile.TemporaryDirectory() as tmp:
+        mem_dir = Path(tmp) / "mem"
+        memory.ensure_scaffold(str(mem_dir))
+        engine = WebEngine(base_url=base_url, use_cdp=live_cdp, shared_cdp=shared_cdp)
+        app = App(engine, mode="probe")
+        try:
+            if live_cdp:
+                app.navigate("/a11y-bad")
+                time.sleep(0.15)
+                findings = app.findings(mem_dir=str(mem_dir))
+            else:
+                engine._metrics.update({"missing_alt_images": 1, "unlabeled_controls": 1, "dom_nodes": 12})
+                findings = app.findings(mem_dir=str(mem_dir))
+            sigs = {f["detector"] for f in findings}
+            det_ok = {"a11y_missing_alt", "a11y_unlabeled_control"} <= sigs
+            detectors.mute(str(mem_dir), "a11y_missing_alt")
+            after_mute = {f["detector"] for f in app.findings(mem_dir=str(mem_dir))}
+            mute_ok = "a11y_missing_alt" not in after_mute
+        finally:
+            app.close()
+        return {
+            "id": "W3_a11y_and_perf_detectors",
+            "mode": "cdp" if live_cdp else "offline",
+            "passed": bool(det_ok and mute_ok),
+            "detected": sorted(sigs),
+            "seconds": round(time.monotonic() - t0, 2),
+        }
+
+
+def _bench_w4_session_reuse(base_url: str, live_cdp: bool, shared_cdp: CDPSession | None = None) -> dict[str, Any]:
+    t0 = time.monotonic()
+    engine = WebEngine(base_url=base_url, use_cdp=live_cdp, shared_cdp=shared_cdp)
+    app = App(engine, mode="probe")
+    try:
+        if live_cdp and shared_cdp is not None:
+            app.navigate("/buggy")
+            time.sleep(0.15)
+            had_errors = len(app.console_errors()) > 0
+            shared_cdp.reset_page()
+            app.navigate("/")
+            clean_after_reset = len(app.console_errors()) == 0 and "/buggy" not in app.route()
+            passed = had_errors and clean_after_reset
+        else:
+            app.navigate("/")
+            passed = True
+    finally:
+        app.close()
+    return {
+        "id": "W4_session_reuse_isolation",
+        "mode": "cdp" if live_cdp else "offline",
+        "passed": bool(passed),
+        "seconds": round(time.monotonic() - t0, 2),
+    }
+
+
+def _bench_d1_webgl3d_canvas(base_url: str, live_cdp: bool, shared_cdp: CDPSession | None = None) -> dict[str, Any]:
+    t0 = time.monotonic()
+    eng = WebGL3DEngine(base_url=base_url, use_cdp=live_cdp, shared_cdp=shared_cdp)
     app = App(eng)
     try:
         if live_cdp:
@@ -407,24 +475,61 @@ def _bench_v1_vision_and_redaction() -> dict[str, Any]:
     }
 
 
+def _bench_e1_doctor_and_report_html() -> dict[str, Any]:
+    t0 = time.monotonic()
+    diag = doctor.diagnose(fix=False)
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = Path(tmp) / "run1"
+        run_dir.mkdir()
+        (run_dir / "report.json").write_text(
+            json.dumps({"outcome": "CONFIRMED", "summary": "Smoke HTML report"}), encoding="utf-8"
+        )
+        (run_dir / "trace1.jsonl").write_text(
+            json.dumps({"type": "decision", "t": 0.4, "step": "checkout", "option": "submit", "ok": True}) + "\n",
+            encoding="utf-8",
+        )
+        out_html = Path(report_html.generate_html(run_dir))
+        content = out_html.read_text(encoding="utf-8")
+        html_ok = out_html.is_file() and "CONFIRMED" in content and "submit" in content
+    passed = isinstance(diag.get("checks"), list) and len(diag["checks"]) >= 5 and html_ok
+    return {
+        "id": "E1_doctor_and_report_html",
+        "mode": "unit",
+        "passed": bool(passed),
+        "seconds": round(time.monotonic() - t0, 2),
+    }
+
+
 def run_benchmark(live_browser: bool | str = "auto") -> dict[str, Any]:
-    """Execute the full Brain Autopilot benchmark suite and return scored summary."""
+    """Execute the full Brain Autopilot v3 benchmark suite and return scored summary."""
     has_browser = find_browser_binary() is not None
     use_cdp = has_browser if live_browser == "auto" else bool(live_browser and has_browser)
     started = time.monotonic()
 
-    with _LocalBenchServer() as srv:
-        results = [
-            _bench_w1_checkout_and_regress(srv.base_url, use_cdp),
-            _bench_w2_bug_detectors(srv.base_url, use_cdp),
-            _bench_m1_mobile_accessibility(),
-            _bench_d1_webgl3d_canvas(srv.base_url, use_cdp),
-            _bench_v1_vision_and_redaction(),
-        ]
+    shared_cdp: CDPSession | None = None
+    if use_cdp:
+        shared_cdp = CDPSession()
+        shared_cdp.start()
+
+    try:
+        with _LocalBenchServer() as srv:
+            results = [
+                _bench_w1_checkout_and_regress(srv.base_url, use_cdp, shared_cdp=shared_cdp),
+                _bench_w2_bug_detectors(srv.base_url, use_cdp, shared_cdp=shared_cdp),
+                _bench_w3_a11y_and_perf(srv.base_url, use_cdp, shared_cdp=shared_cdp),
+                _bench_w4_session_reuse(srv.base_url, use_cdp, shared_cdp=shared_cdp),
+                _bench_m1_mobile_accessibility(),
+                _bench_d1_webgl3d_canvas(srv.base_url, use_cdp, shared_cdp=shared_cdp),
+                _bench_v1_vision_and_redaction(),
+                _bench_e1_doctor_and_report_html(),
+            ]
+    finally:
+        if shared_cdp is not None:
+            shared_cdp.close()
 
     passed_count = sum(1 for r in results if r["passed"])
     return {
-        "suite": "brain-autopilot-core-v2",
+        "suite": "brain-autopilot-core-v3",
         "browser_available": has_browser,
         "cdp_enabled": use_cdp,
         "score": passed_count,

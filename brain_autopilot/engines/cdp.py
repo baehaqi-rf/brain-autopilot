@@ -44,6 +44,22 @@ TELEMETRY_INIT_JS = r"""
     }).observe({ type: 'layout-shift', buffered: true });
   } catch (_) {}
 
+  window.__ba_lcp = 0;
+  try {
+    new PerformanceObserver((list) => {
+      const entries = list.getEntries();
+      if (entries.length) {
+        const last = entries[entries.length - 1];
+        window.__ba_lcp = Math.max(window.__ba_lcp || 0, last.startTime || 0);
+      }
+    }).observe({ type: 'largest-contentful-paint', buffered: true });
+  } catch (_) {}
+
+  window.addEventListener('unhandledrejection', (e) => {
+    const reason = e && e.reason ? String(e.reason) : 'unhandledrejection';
+    console.error('UnhandledPromiseRejection: ' + reason);
+  });
+
   window.__ba_fps = 60;
   window.__ba_draw_calls = 0;
   window.__ba_triangles = 0;
@@ -194,11 +210,20 @@ DOM_SNAPSHOT_JS = r"""
   }
 
   let brokenImages = 0;
+  let missingAltImages = 0;
   for (const img of document.querySelectorAll('img')) {
     if (img.complete && img.naturalWidth === 0) brokenImages++;
+    if (!img.hasAttribute('alt')) missingAltImages++;
+  }
+
+  let unlabeledControls = 0;
+  for (const el of elements) {
+    if (!el.visible) continue;
+    if (!el.label) unlabeledControls++;
   }
 
   const canvases = Array.from(document.querySelectorAll('canvas'));
+  const domNodes = document.querySelectorAll('*').length;
 
   return {
     url: location.href,
@@ -210,7 +235,11 @@ DOM_SNAPSHOT_JS = r"""
       cls: Math.round((window.__ba_cls || 0) * 10000) / 10000,
       overflow_elements: overflowCount,
       broken_images: brokenImages,
+      missing_alt_images: missingAltImages,
+      unlabeled_controls: unlabeledControls,
       touch_target_violations: touchViolations,
+      dom_nodes: domNodes,
+      lcp_ms: Math.round(window.__ba_lcp || 0),
       fps: window.__ba_fps || 60,
       scene_objects: canvases.length,
     }
@@ -448,7 +477,7 @@ class CDPSession:
                         page_ws = t["webSocketDebuggerUrl"]
                         break
             except (OSError, ValueError):
-                time.sleep(0.05)
+                time.sleep(0.02)
         if not page_ws:
             self.close()
             raise RuntimeError("No CDP page target discovered.")
@@ -672,6 +701,28 @@ class CDPSession:
         res = self.call("Page.captureScreenshot", {"format": fmt})
         b64 = res.get("data")
         return base64.b64decode(b64) if b64 else None
+
+    def reset_page(self) -> None:
+        """Cleanly reset page state, storage, cookies, and error buffers for warm session reuse."""
+        if not self.connected:
+            return
+        self.console_errors.clear()
+        self.network_errors.clear()
+        try:
+            self.eval_js("try { localStorage.clear(); sessionStorage.clear(); } catch (_) {}")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.call("Network.clearBrowserCookies", timeout=3.0)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.navigate("about:blank", wait_load=False)
+        except Exception:  # noqa: BLE001
+            pass
+        self.console_errors.clear()
+        self.network_errors.clear()
+        self.current_url = "about:blank"
 
     def close(self) -> None:
         ws = self._ws

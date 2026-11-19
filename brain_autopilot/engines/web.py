@@ -107,10 +107,12 @@ class WebEngine(AppEngine):
         project_root: str | None = None,
         base_url: str | None = None,
         use_cdp: bool | str = "auto",
+        shared_cdp: CDPSession | None = None,
     ) -> None:
         super().__init__(project_root=project_root, base_url=base_url)
         self.use_cdp = use_cdp
-        self._cdp: CDPSession | None = None
+        self._cdp: CDPSession | None = shared_cdp
+        self._owns_cdp: bool = shared_cdp is None
         self._dirty: bool = False
 
     def _should_use_cdp(self, target_url: str) -> bool:
@@ -339,5 +341,8 @@ class WebEngine(AppEngine):
 
     def close(self) -> None:
         if self._cdp is not None:
-            self._cdp.close()
+            if self._owns_cdp:
+                self._cdp.close()
+            else:
+                self._cdp.reset_page()
             self._cdp = None

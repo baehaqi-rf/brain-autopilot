@@ -21,6 +21,8 @@ FILE = "detectors.json"
 DEFAULT_CLS_MAX = 0.1
 DEFAULT_MIN_TOUCH_PX = 44
 DEFAULT_MIN_FPS = 15.0
+DEFAULT_MAX_DOM_NODES = 3000
+DEFAULT_MAX_LCP_MS = 2500.0
 
 
 def path(folder: str) -> str:
@@ -62,6 +64,8 @@ def config(folder: str | None) -> dict[str, Any]:
     out.setdefault("cls_max", DEFAULT_CLS_MAX)
     out.setdefault("min_touch_px", DEFAULT_MIN_TOUCH_PX)
     out.setdefault("min_fps", DEFAULT_MIN_FPS)
+    out.setdefault("max_dom_nodes", DEFAULT_MAX_DOM_NODES)
+    out.setdefault("max_lcp_ms", DEFAULT_MAX_LCP_MS)
     return out
 
 
@@ -210,6 +214,48 @@ def evaluate(app_or_engine: Any, folder: str | None = None) -> list[dict[str, An
     broken_imgs = int(metrics.get("broken_images") or 0)
     if broken_imgs > 0:
         add("broken_image", "broken_image:dom", "error", f"{broken_imgs} broken image(s) detected", broken_imgs)
+
+    missing_alt = int(metrics.get("missing_alt_images") or 0)
+    if missing_alt > 0:
+        add(
+            "a11y_missing_alt",
+            "a11y_missing_alt:img",
+            "warning",
+            f"{missing_alt} <img> element(s) missing alt attribute (WCAG 1.1.1)",
+            missing_alt,
+        )
+
+    unlabeled = int(metrics.get("unlabeled_controls") or 0)
+    if unlabeled > 0:
+        add(
+            "a11y_unlabeled_control",
+            "a11y_unlabeled_control:interactive",
+            "warning",
+            f"{unlabeled} interactive control(s) missing accessible name/label (WCAG 4.1.2)",
+            unlabeled,
+        )
+
+    dom_nodes = int(metrics.get("dom_nodes") or 0)
+    max_dom = int(cfg.get("max_dom_nodes") or DEFAULT_MAX_DOM_NODES)
+    if dom_nodes > max_dom:
+        add(
+            "large_dom",
+            "large_dom:nodes",
+            "warning",
+            f"DOM contains {dom_nodes} nodes (exceeds {max_dom})",
+            dom_nodes,
+        )
+
+    lcp_ms = float(metrics.get("lcp_ms") or 0.0)
+    max_lcp = float(cfg.get("max_lcp_ms") or DEFAULT_MAX_LCP_MS)
+    if lcp_ms > max_lcp:
+        add(
+            "slow_lcp",
+            "slow_lcp:render",
+            "warning",
+            f"Largest Contentful Paint {lcp_ms:.0f}ms exceeds {max_lcp:.0f}ms",
+            lcp_ms,
+        )
 
     if metrics.get("canvas_present") is False:
         add("blank_canvas", "blank_canvas:missing", "error", "Expected 3D/WebGL <canvas> is missing", metrics)

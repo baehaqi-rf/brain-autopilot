@@ -7,7 +7,7 @@ import json
 import os
 import sys
 
-from . import __version__, bench, codex, detectors, mcp, memory, regress, runtime
+from . import __version__, bench, codex, detectors, doctor, mcp, memory, regress, report_html, runtime
 from .engines import detect_engine
 from .kit import App
 
@@ -58,6 +58,13 @@ def main(argv: list[str] | None = None) -> int:
 
     p_bench = sub.add_parser("bench", help="Run the built-in Web/Mobile/3D benchmark suite")
     p_bench.add_argument("--offline", action="store_true", help="Force offline mode without launching Chrome/Edge CDP")
+
+    p_doc = sub.add_parser("doctor", help="Diagnose Python, IDE/Pyrefly typing, CDP browser, ADB, and skill wiring")
+    p_doc.add_argument("--fix", action="store_true", help="Auto-repair PEP 660 dynamic editable .pth for Pyrefly/Pyright")
+
+    p_html = sub.add_parser("report-html", help="Generate a self-contained HTML report from a run directory")
+    p_html.add_argument("run_dir", help="Path to runs/<run_id> directory")
+    p_html.add_argument("--out", default=None, help="Output HTML file path (defaults to <run_dir>/report.html)")
 
     sub.add_parser("mcp", help="Start the stdio MCP server for Google Antigravity / Claude Code / Codex")
 
@@ -128,6 +135,16 @@ def main(argv: list[str] | None = None) -> int:
         summary = bench.run_benchmark(live_browser=False if args.offline else "auto")
         print(json.dumps(summary, indent=2))
         return 0 if summary["score"] == summary["total"] else 1
+
+    if args.cmd == "doctor":
+        diag = doctor.diagnose(fix=bool(args.fix))
+        print(json.dumps(diag, indent=2))
+        return 0 if diag["ok"] else 1
+
+    if args.cmd == "report-html":
+        out = report_html.generate_html(args.run_dir, out_path=args.out)
+        print(json.dumps({"report_html": out}, indent=2))
+        return 0
 
     if args.cmd == "check":
         engine = detect_engine(args.project)

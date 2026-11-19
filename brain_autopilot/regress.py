@@ -322,6 +322,7 @@ def replay_all(
     seconds: float | None = None,
     retries: int = RETRIES,
     app_factory: Any = None,
+    shared_cdp: Any = None,
 ) -> dict[str, Any]:
     """Replay all regressions for `project_root`, retrying once to flag flaky harnesses."""
     target_mem = str(mem_dir) if mem_dir else codex.project_memory_dir(project_root)
@@ -332,6 +333,9 @@ def replay_all(
         engine = detect_engine(project_root)
         if base_url:
             engine.base_url = base_url.rstrip("/")
+        if shared_cdp is not None and hasattr(engine, "_cdp") and hasattr(engine, "_owns_cdp"):
+            engine._cdp = shared_cdp
+            engine._owns_cdp = False
         app = app_factory(engine) if callable(app_factory) else App(engine, mode="episode")
         try:
             r = replay(app, rdir, mem_dir=target_mem, frozen_lib=frozen_lib, seconds=seconds)

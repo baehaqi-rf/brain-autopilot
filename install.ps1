@@ -92,11 +92,15 @@ Get-ChildItem -Path (Join-Path $repoDir "agents") -Filter "*.md" | ForEach-Objec
     Write-Host "Installed agent: $(Join-Path $tgtAgents $_.Name)" -ForegroundColor Green
 }
 
-# --- 3. Editable Python package install ----------------------------------------
+# --- 3. Editable Python package install (static .pth for Pyrefly/Pyright) ------
 if (-not $SkipPip) {
-    Write-Host "Installing brain-autopilot Python package (editable)..." -ForegroundColor Yellow
-    python -m pip install -e $repoDir --quiet
-    if ($LASTEXITCODE -ne 0) { throw "pip install -e failed (exit $LASTEXITCODE)" }
+    Write-Host "Installing brain-autopilot Python package (IDE-compatible editable mode)..." -ForegroundColor Yellow
+    python -m pip install -e $repoDir --config-settings editable_mode=compat --quiet
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Falling back to standard editable install..." -ForegroundColor DarkYellow
+        python -m pip install -e $repoDir --quiet
+        if ($LASTEXITCODE -ne 0) { throw "pip install -e failed (exit $LASTEXITCODE)" }
+    }
     Write-Host "Installed Python package: brain-autopilot" -ForegroundColor Green
 }
 

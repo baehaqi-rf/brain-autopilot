@@ -2,10 +2,10 @@
 name: brain-autopilot
 description: Continually learning real-time autonomous verification, exploration, and playtesting engine for Web Apps (Next.js/React/Astro/Vite), Mobile Apps (Expo/React Native/Flutter/Android ADB), and 3D/WebGL Apps (Three.js/R3F/Shaders). Replicates and advances the architectural pillars of ramenvr/autopilot alongside Playwright MCP, Stagehand, and Maestro benchmarks for modern application engineering. Use when exploring an app for bugs, verifying UI/UX/state claims empirically, replaying deterministic regressions, reaching end-to-end user goals, or building compound project memory across runs.
 metadata:
-  version: "2.0.0"
+  version: "3.0.0"
 ---
 
-# Brain Autopilot v2.0 (Web, Mobile & 3D App Playtesting Engine)
+# Brain Autopilot v3.0 (Web, Mobile & 3D App Playtesting Engine)
 
 `brain-autopilot` combines the continual-learning verification pillars of `ramenvr/autopilot` with live Chrome/Edge **CDP automation** (`microsoft/playwright-mcp` / `stagehand`), **Android ADB / Maestro** execution, configurable **Bug Detectors**, **Zero-LLM Regression Replay**, **Secret/Path Redaction**, and **Blind Vision Frame Inspection**.
 

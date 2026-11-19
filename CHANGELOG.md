@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
+## [3.0.0] - 2026-11-20
+
+### Fixed
+- **Antigravity / Pyrefly IDE `missing-import` on Generated `harness.py`:** Switched `install.ps1` and `install.sh` to `--config-settings editable_mode=compat` and added PEP 561 `brain_autopilot/py.typed` so static type checkers (Pyrefly, Pyright, Pylance, mypy) resolve `brain_autopilot.kit` natively instead of failing on PEP 660 dynamic editable finder hooks.
+- **CI Headless Browser Startup Stability:** Hardened `CDPSession.start()` with `--disable-dev-shm-usage`, CI `--no-sandbox`, longer DevTools port startup timeout (`25s`), and faster target polling (`20ms`).
+
+### Added
+- **Environment Diagnostics & Self-Repair (`brain_autopilot/doctor.py`, `brain-autopilot doctor --fix`, MCP `doctor` tool):** Checks Python version, `py.typed` / static `.pth` IDE compatibility, Chrome/Edge CDP binary, Android ADB, and Antigravity skill/agent wiring, with one-command auto-repair for PEP 660 editable hooks.
+- **Warm Shared CDP Session Pool (`CDPSession.reset_page()`, `WebEngine(..., shared_cdp=...)`):** Cleanly resets cookies, storage, and error buffers between runs/regressions/benchmarks without cold-starting Chrome, cutting full live-CDP benchmark runtime by >50%.
+- **v3.0 Accessibility & Performance Detectors (`brain_autopilot/detectors.py`, `brain_autopilot/engines/cdp.py`):** Added `a11y_missing_alt` (WCAG 1.1.1), `a11y_unlabeled_control` (WCAG 4.1.2), `large_dom` (`dom_nodes > 3000`), `slow_lcp` (`lcp_ms > 2500ms`), and `unhandledrejection` telemetry.
+- **Zero-Dependency Self-Contained HTML Reports (`brain_autopilot/report_html.py`, `brain-autopilot report-html`):** Generates portable dark-mode `report.html` summaries with KPI cards, detector findings, decision timelines, and base64-embedded screenshots.
+- **Expanded v3.0 Benchmark Suite (`brain-autopilot-core-v3`, 8 benchmarks):** Adds `W3_a11y_and_perf_detectors`, `W4_session_reuse_isolation`, and `E1_doctor_and_report_html` alongside warm shared-CDP execution.
+
 ## [2.0.0] - 2026-11-14
 
 ### Added
