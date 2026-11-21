@@ -12,9 +12,11 @@ Benchmarked against `ramenvr/autopilot`:
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import inspect
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -22,7 +24,7 @@ from typing import Any, Callable
 
 from . import detectors
 from .kit.app import App
-from .kit.harness import Harness, Option, Result, Status
+from .kit.harness import Harness, Option, Result
 from .redact import Redactor
 
 MIN_DECISIONS = 3
@@ -173,16 +175,47 @@ def check_harness(
     }
 
 
+def _obs_fingerprint(facts: dict[str, Any]) -> str:
+    """Stable short hash of public `facts(obs)` ignoring incidental timing keys (`t`, `*_t`, `*_at`)."""
+    cleaned = {
+        str(k): jsonable(v)
+        for k, v in (facts or {}).items()
+        if not (isinstance(k, str) and (k == "t" or k.endswith(("_t", "_at"))))
+    }
+    raw = json.dumps(cleaned, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
 def default_decision_policy(
     options: list[Option],
     counts: dict[str, int],
     failed_recently: set[str],
+    noop_in_state: set[str] | None = None,
+    option_stats: dict[str, dict[str, int]] | None = None,
 ) -> Option:
-    """Smart autonomous selector: prioritizes `urgent` options, then least-tried non-failing options."""
+    """Loop-aware autonomous selector: prioritizes `urgent`, escapes no-op loops, and favors high-yield options."""
     urgent = [o for o in options if o.urgent]
     pool = urgent if urgent else options
     non_failed = [o for o in pool if o.name not in failed_recently] or pool
-    return min(non_failed, key=lambda o: counts.get(o.name, 0))
+    noops = noop_in_state or set()
+    productive = [o for o in non_failed if o.name not in noops] or non_failed
+
+    # Explore untried options first so every legal choice gets empirically tested once.
+    untried = [o for o in productive if counts.get(o.name, 0) == 0]
+    if untried:
+        return untried[0]
+
+    stats_map = option_stats or {}
+
+    def _score(opt: Option) -> tuple[float, int]:
+        st = stats_map.get(opt.name) or {}
+        runs = max(1, int(st.get("runs") or counts.get(opt.name, 1)))
+        yield_hits = max(int(st.get("effect_true") or 0), int(st.get("state_changed") or 0))
+        yield_rate = yield_hits / float(runs)
+        # Lower tuple is better: higher yield rate first, then fewer runs.
+        return (-yield_rate, counts.get(opt.name, 0))
+
+    return min(productive, key=_score)
 
 
 def summarize_trace(events: list[dict[str, Any]], episode_result: dict[str, Any] | None = None) -> str:
@@ -194,10 +227,11 @@ def summarize_trace(events: list[dict[str, Any]], episode_result: dict[str, Any]
     note = res.get("note") or ""
     decisions = res.get("decisions", 0)
     multi = res.get("multi_option_decisions", 0)
+    noop_count = res.get("noop_decisions", 0)
 
     lines.append(f"Goal: {goal}")
     lines.append(f"Outcome: {state}" + (f" - {note}" if note else ""))
-    lines.append(f"Decisions: {decisions} total ({multi} multi-option)")
+    lines.append(f"Decisions: {decisions} total ({multi} multi-option, {noop_count} no-op)")
 
     progress = res.get("progress") or {}
     done = progress.get("done") or []
@@ -215,7 +249,8 @@ def summarize_trace(events: list[dict[str, Any]], episode_result: dict[str, Any]
         for name, st in sorted(option_stats.items()):
             lines.append(
                 f"  - {name}: runs={st.get('runs', 0)}, ok={st.get('ok', 0)}, "
-                f"effect_true={st.get('effect_true', 0)}, failed={st.get('failed', 0)}"
+                f"effect_true={st.get('effect_true', 0)}, state_changed={st.get('state_changed', 0)}, "
+                f"failed={st.get('failed', 0)}"
             )
 
     findings = res.get("findings") or []
@@ -231,9 +266,10 @@ def summarize_trace(events: list[dict[str, Any]], episode_result: dict[str, Any]
         lines.append("Timeline (recent decisions):")
         for ev in decision_events[-15:]:
             dur = f" ({ev['duration_s']:.2f}s)" if isinstance(ev.get("duration_s"), (int, float)) else ""
+            sc = f", state_changed={ev['state_changed']}" if "state_changed" in ev else ""
             lines.append(
                 f"  t={ev.get('t', 0):.2f}s [{ev.get('step') or '-'}] -> {ev.get('chosen')}{dur}: "
-                f"ok={ev.get('ok')}, effect={ev.get('effect')} ({ev.get('why', '')})"
+                f"ok={ev.get('ok')}, effect={ev.get('effect')}{sc} ({ev.get('why', '')})"
             )
 
     return "\n".join(lines) + "\n"
@@ -294,130 +330,182 @@ def run_harness(
 
     decisions = 0
     multi_option_decisions = 0
+    noop_decisions = 0
     option_counts: dict[str, int] = {}
     option_stats: dict[str, dict[str, int]] = {}
-    failed_recently: set[str] = set()
+    state_failed: dict[tuple[str | None, str], set[str]] = {}
+    state_noops: dict[tuple[str | None, str], set[str]] = {}
     trace_events: list[dict[str, Any]] = []
     stalled_info: dict[str, Any] | None = None
+    saved_frames: list[str] = []
 
-    if not restart:
-        trace_events.append({"kind": "continued", "t": 0.0, "done": sorted(done_steps)})
-    else:
-        trace_events.append({"kind": "start", "t": 0.0, "goal": scrub.text(h.goal)})
+    orig_on_frame = app.on_frame
+    if trace_path and capture_frames:
+        frame_dir = Path(trace_path).parent
+        frame_dir.mkdir(parents=True, exist_ok=True)
+        frame_idx = [0]
 
-    if capture_frames:
-        app.screenshot(label="episode_start")
+        def _persist_on_frame(data: bytes, ts: float, label: str) -> None:
+            if callable(orig_on_frame):
+                orig_on_frame(data, ts, label)
+            if data and data.startswith(b"\x89PNG") and frame_idx[0] < 12:
+                frame_idx[0] += 1
+                safe_lbl = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(label or "frame")).strip("_")[:32] or "frame"
+                out_png = frame_dir / f"frame_{frame_idx[0]:02d}_{safe_lbl}.png"
+                try:
+                    out_png.write_bytes(data)
+                    saved_frames.append(str(out_png))
+                except OSError:
+                    pass
 
-    tick_dt = 1.0 / max(1.0, float(h.tick_hz or 10.0))
-    obs = h.observe(app)
-    _active_step_and_options(h, obs, done_steps, h.options(obs))
-    status = h.status(obs)
+        app.on_frame = _persist_on_frame
 
-    while not status.over and (time.monotonic() - start_wall) < seconds:
-        elapsed = round(time.monotonic() - start_wall, 3)
-        all_opts = h.options(obs)
-        prev_done_count = len(done_steps)
-        step_name, offered_opts, mismatches = _active_step_and_options(h, obs, done_steps, all_opts)
-
-        if len(done_steps) > prev_done_count:
-            last_progress_wall = time.monotonic()
-            if capture_frames:
-                app.screenshot(label=f"step_progress_{len(done_steps)}")
-
-        if step_name != last_step_name:
-            last_step_name = step_name
-            step_entered_wall = time.monotonic()
-
-        status = h.status(obs)
-        if status.over:
-            break
-
-        now_wall = time.monotonic()
-        if h.stall_seconds > 0 and (now_wall - last_progress_wall) >= h.stall_seconds:
-            stalled_info = {
-                "reason": "stall_seconds_exceeded",
-                "step": step_name,
-                "seconds": round(now_wall - last_progress_wall, 2),
-                "tried": option_stats,
-            }
-            if capture_frames:
-                app.screenshot(label="stalled")
-            break
-        if h.step_seconds > 0 and step_name and (now_wall - step_entered_wall) >= h.step_seconds:
-            stalled_info = {
-                "reason": "step_seconds_exceeded",
-                "step": step_name,
-                "seconds": round(now_wall - step_entered_wall, 2),
-                "tried": option_stats,
-            }
-            if capture_frames:
-                app.screenshot(label="step_stalled")
-            break
-
-        if not offered_opts:
-            _drive_generator(h.idle(app, obs), max_seconds=tick_dt, tick_dt=tick_dt)
-            obs = h.observe(app)
-            status = h.status(obs)
-            continue
-
-        decisions += 1
-        if len(offered_opts) >= 2:
-            multi_option_decisions += 1
-
-        chosen = (
-            chooser(offered_opts, h.facts(obs))
-            if chooser is not None
-            else default_decision_policy(offered_opts, option_counts, failed_recently)
-        )
-        option_counts[chosen.name] = option_counts.get(chosen.name, 0) + 1
-        stats = option_stats.setdefault(chosen.name, {"runs": 0, "ok": 0, "effect_true": 0, "failed": 0})
-        stats["runs"] += 1
-
-        before_obs = dict(obs)
-        opt_t0 = time.monotonic()
-        res = _drive_generator(chosen.run(app, obs), max_seconds=chosen.max_seconds, tick_dt=tick_dt)
-        opt_dur = round(time.monotonic() - opt_t0, 3)
-        obs = h.observe(app)
-        eff = chosen.effect(before_obs, obs) if chosen.effect is not None else None
-
-        worked = bool(res) and (eff is not False)
-        if worked:
-            stats["ok"] += 1
-            if eff is True:
-                stats["effect_true"] += 1
-            last_progress_wall = time.monotonic()
-            failed_recently.discard(chosen.name)
+    try:
+        if not restart:
+            trace_events.append({"kind": "continued", "t": 0.0, "done": sorted(done_steps)})
         else:
-            stats["failed"] += 1
-            failed_recently.add(chosen.name)
-            if capture_frames:
-                app.screenshot(label=f"fail_{chosen.name}")
+            trace_events.append({"kind": "start", "t": 0.0, "goal": scrub.text(h.goal)})
 
+        if capture_frames:
+            app.screenshot(label="episode_start")
+
+        tick_dt = 1.0 / max(1.0, float(h.tick_hz or 10.0))
+        obs = h.observe(app)
         _active_step_and_options(h, obs, done_steps, h.options(obs))
-        if capture_frames and len(done_steps) > prev_done_count:
-            app.screenshot(label=f"step_progress_{len(done_steps)}")
         status = h.status(obs)
 
-        trace_events.append(
-            scrub.data(
-                {
-                    "kind": "decision",
-                    "t": elapsed,
-                    "duration_s": opt_dur,
-                    "step": step_name,
-                    "offered": [o.name for o in offered_opts],
-                    "chosen": chosen.name,
-                    "ok": bool(res),
-                    "why": res.why,
-                    "effect": eff,
-                    "done_steps": sorted(done_steps),
-                    "mismatches": mismatches,
-                }
-            )
-        )
+        while not status.over and (time.monotonic() - start_wall) < seconds:
+            elapsed = round(time.monotonic() - start_wall, 3)
+            all_opts = h.options(obs)
+            prev_done_count = len(done_steps)
+            step_name, offered_opts, mismatches = _active_step_and_options(h, obs, done_steps, all_opts)
 
-    if capture_frames:
-        app.screenshot(label="episode_end")
+            if len(done_steps) > prev_done_count:
+                last_progress_wall = time.monotonic()
+                if capture_frames:
+                    app.screenshot(label=f"step_progress_{len(done_steps)}")
+
+            if step_name != last_step_name:
+                last_step_name = step_name
+                step_entered_wall = time.monotonic()
+
+            status = h.status(obs)
+            if status.over:
+                break
+
+            now_wall = time.monotonic()
+            if h.stall_seconds > 0 and (now_wall - last_progress_wall) >= h.stall_seconds:
+                stalled_info = {
+                    "reason": "stall_seconds_exceeded",
+                    "step": step_name,
+                    "seconds": round(now_wall - last_progress_wall, 2),
+                    "tried": option_stats,
+                }
+                if capture_frames:
+                    app.screenshot(label="stalled")
+                break
+            if h.step_seconds > 0 and step_name and (now_wall - step_entered_wall) >= h.step_seconds:
+                stalled_info = {
+                    "reason": "step_seconds_exceeded",
+                    "step": step_name,
+                    "seconds": round(now_wall - step_entered_wall, 2),
+                    "tried": option_stats,
+                }
+                if capture_frames:
+                    app.screenshot(label="step_stalled")
+                break
+
+            if not offered_opts:
+                _drive_generator(h.idle(app, obs), max_seconds=tick_dt, tick_dt=tick_dt)
+                obs = h.observe(app)
+                status = h.status(obs)
+                continue
+
+            decisions += 1
+            if len(offered_opts) >= 2:
+                multi_option_decisions += 1
+
+            before_facts = h.facts(obs)
+            before_fp = _obs_fingerprint(before_facts)
+            state_key = (step_name, before_fp)
+
+            chosen = (
+                chooser(offered_opts, before_facts)
+                if chooser is not None
+                else default_decision_policy(
+                    offered_opts,
+                    option_counts,
+                    state_failed.get(state_key, set()),
+                    noop_in_state=state_noops.get(state_key),
+                    option_stats=option_stats,
+                )
+            )
+            option_counts[chosen.name] = option_counts.get(chosen.name, 0) + 1
+            stats = option_stats.setdefault(
+                chosen.name, {"runs": 0, "ok": 0, "effect_true": 0, "state_changed": 0, "failed": 0}
+            )
+            stats["runs"] += 1
+
+            before_obs = dict(obs)
+            opt_t0 = time.monotonic()
+            res = _drive_generator(chosen.run(app, obs), max_seconds=chosen.max_seconds, tick_dt=tick_dt)
+            opt_dur = round(time.monotonic() - opt_t0, 3)
+            obs = h.observe(app)
+            after_fp = _obs_fingerprint(h.facts(obs))
+            state_changed = after_fp != before_fp
+            eff = chosen.effect(before_obs, obs) if chosen.effect is not None else None
+
+            worked = bool(res) and (eff is not False)
+            if state_changed:
+                stats["state_changed"] += 1
+                state_noops.get(state_key, set()).discard(chosen.name)
+            else:
+                noop_decisions += 1
+                state_noops.setdefault(state_key, set()).add(chosen.name)
+
+            if worked:
+                stats["ok"] += 1
+                if eff is True:
+                    stats["effect_true"] += 1
+                if state_changed or (eff is True and stats["runs"] == 1):
+                    last_progress_wall = time.monotonic()
+                state_failed.get(state_key, set()).discard(chosen.name)
+            else:
+                stats["failed"] += 1
+                state_failed.setdefault(state_key, set()).add(chosen.name)
+                if capture_frames:
+                    app.screenshot(label=f"fail_{chosen.name}")
+
+            _active_step_and_options(h, obs, done_steps, h.options(obs))
+            if len(done_steps) > prev_done_count:
+                last_progress_wall = time.monotonic()
+                if capture_frames:
+                    app.screenshot(label=f"step_progress_{len(done_steps)}")
+            status = h.status(obs)
+
+            trace_events.append(
+                scrub.data(
+                    {
+                        "kind": "decision",
+                        "t": elapsed,
+                        "duration_s": opt_dur,
+                        "step": step_name,
+                        "offered": [o.name for o in offered_opts],
+                        "chosen": chosen.name,
+                        "ok": bool(res),
+                        "why": res.why,
+                        "effect": eff,
+                        "state_changed": state_changed,
+                        "done_steps": sorted(done_steps),
+                        "mismatches": mismatches,
+                    }
+                )
+            )
+
+        if capture_frames:
+            app.screenshot(label="episode_end")
+    finally:
+        app.on_frame = orig_on_frame
 
     findings = detectors.evaluate(app, folder=mem_str)
     h.teardown(app)
@@ -452,12 +540,14 @@ def run_harness(
             "evidence": status.evidence,
             "decisions": decisions,
             "multi_option_decisions": multi_option_decisions,
+            "noop_decisions": noop_decisions,
             "option_stats": option_stats,
             "progress": progress_out,
             "findings": findings,
             "console_errors": app.console_errors(),
             "network_errors": app.network_errors(),
             "episode_direct_writes": [w for w in app.direct_writes if w.get("mode") == "episode"],
+            "saved_frames": saved_frames,
             "trace_events": len(trace_events),
         }
     )

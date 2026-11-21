@@ -10,10 +10,16 @@ from __future__ import annotations
 import base64
 import html
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 from . import __version__
+
+
+def _natural_trace_key(path: Path) -> tuple[int, str]:
+    m = re.search(r"(\d+)", path.stem)
+    return (int(m.group(1)) if m else 0, path.name)
 
 
 def _load_json(path: Path) -> Any:
@@ -46,24 +52,38 @@ def generate_html(run_dir: str | Path, out_path: str | Path | None = None) -> st
         raise FileNotFoundError(f"Run directory not found: {root}")
 
     report = _load_json(root / "report.json") or {}
-    traces = sorted(root.glob("trace*.jsonl"))
+    traces = sorted(root.glob("trace*.jsonl"), key=_natural_trace_key)
     trace_rows = _load_trace(traces[-1]) if traces else []
-    summaries = sorted(root.glob("trace*_summary.txt"))
+    summaries = sorted(root.glob("trace*_summary.txt"), key=_natural_trace_key)
     summary_text = summaries[-1].read_text(encoding="utf-8", errors="replace") if summaries else ""
     pngs = sorted(root.glob("*.png"))[:12]
 
-    decisions = [r for r in trace_rows if r.get("type") == "decision"]
+    decisions = [r for r in trace_rows if r.get("kind") == "decision" or r.get("type") == "decision"]
     findings: list[dict[str, Any]] = []
     seen_sigs: set[str] = set()
-    for row in trace_rows:
+    for row in [*trace_rows, report]:
+        if not isinstance(row, dict):
+            continue
         for f in row.get("findings") or []:
             if isinstance(f, dict):
                 sig = str(f.get("signature") or f.get("message") or "")
                 if sig and sig not in seen_sigs:
                     seen_sigs.add(sig)
                     findings.append(f)
+            elif isinstance(f, str) and f.strip():
+                msg = f.strip()
+                sig = f"report:{msg}"
+                if sig not in seen_sigs:
+                    seen_sigs.add(sig)
+                    findings.append({"severity": "info", "detector": "report", "signature": sig, "message": msg})
 
     outcome = str(report.get("outcome") or ("COMPLETED" if trace_rows else "UNKNOWN"))
+    outcome_up = outcome.upper()
+    outcome_cls = (
+        "sev-error"
+        if outcome_up in ("DENIED", "FAILED", "NOT_ACHIEVED")
+        else ("sev-warning" if outcome_up in ("INCONCLUSIVE", "STALLED", "UNKNOWN") else "sev-ok")
+    )
     title = html.escape(f"Brain Autopilot v{__version__} Report - {root.name}")
     outcome_badge = html.escape(outcome)
     summary_line = html.escape(str(report.get("summary") or "Autonomous verification run report"))
@@ -85,17 +105,23 @@ def generate_html(run_dir: str | Path, out_path: str | Path | None = None) -> st
     if decisions:
         for idx, d in enumerate(decisions, 1):
             t_val = html.escape(str(d.get("t", "")))
-            opt = html.escape(str(d.get("option") or d.get("chosen") or ""))
-            step = html.escape(str(d.get("step") or ""))
+            opt = html.escape(str(d.get("chosen") or d.get("option") or ""))
+            step = html.escape(str(d.get("step") or "-"))
             ok = d.get("ok", True)
+            eff = d.get("effect")
+            sc = d.get("state_changed")
+            eff_str = html.escape("—" if eff is None else str(eff))
+            sc_str = html.escape("—" if sc is None else ("yes" if sc else "no-op"))
+            why_str = html.escape(str(d.get("why") or "")[:90])
             status_lbl = "PASS" if ok else "FAIL"
             cls = "sev-ok" if ok else "sev-error"
             decision_rows_html += (
                 f"<tr><td>{idx}</td><td>{t_val}s</td><td><code>{step}</code></td>"
-                f"<td><code>{opt}</code></td><td><span class='badge {cls}'>{status_lbl}</span></td></tr>"
+                f"<td><code>{opt}</code></td><td>{eff_str}</td><td>{sc_str}</td>"
+                f"<td><span class='badge {cls}'>{status_lbl}</span> <span class='muted'>{why_str}</span></td></tr>"
             )
     else:
-        decision_rows_html = "<tr><td colspan='5' class='muted'>No trace decisions recorded.</td></tr>"
+        decision_rows_html = "<tr><td colspan='7' class='muted'>No trace decisions recorded.</td></tr>"
 
     gallery_html = ""
     for png in pngs:
@@ -150,7 +176,7 @@ def generate_html(run_dir: str | Path, out_path: str | Path | None = None) -> st
       <h1>{title}</h1>
       <div class="muted">{summary_line}</div>
     </div>
-    <span class="badge sev-ok">{outcome_badge}</span>
+    <span class="badge {outcome_cls}">{outcome_badge}</span>
   </header>
 
   <section class="grid">
@@ -168,7 +194,7 @@ def generate_html(run_dir: str | Path, out_path: str | Path | None = None) -> st
 
   <h2>Decision Timeline</h2>
   <table>
-    <thead><tr><th>#</th><th>Time</th><th>Step</th><th>Option</th><th>Status</th></tr></thead>
+    <thead><tr><th>#</th><th>Time</th><th>Step</th><th>Option</th><th>Effect</th><th>State Δ</th><th>Status</th></tr></thead>
     <tbody>{decision_rows_html}</tbody>
   </table>
 

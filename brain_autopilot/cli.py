@@ -35,6 +35,7 @@ def main(argv: list[str] | None = None) -> int:
     p_check.add_argument("harness", help="Path to harness.py")
     p_check.add_argument("--project", default=".", help="Project root directory")
     p_check.add_argument("--url", default=None, help="Live app base URL")
+    p_check.add_argument("--viewport", default=None, help="Viewport preset (`mobile`, `android`, `tablet`, `desktop`, or `WxH`)")
 
     p_run = sub.add_parser("run", help="Run a harness.py episode against a project")
     p_run.add_argument("harness", help="Path to harness.py")
@@ -42,6 +43,7 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--url", default=None, help="Live app base URL")
     p_run.add_argument("--seconds", type=float, default=30.0, help="Episode duration in seconds")
     p_run.add_argument("--no-restart", action="store_true", help="Continue without restarting app state")
+    p_run.add_argument("--viewport", default=None, help="Viewport preset (`mobile`, `android`, `tablet`, `desktop`, or `WxH`)")
 
     p_reg = sub.add_parser("regress", help="Replay saved deterministic regressions for a project")
     p_reg.add_argument("project_root", nargs="?", default=".")
@@ -153,6 +155,8 @@ def main(argv: list[str] | None = None) -> int:
         app = App(engine, mode="probe")
         mem_dir = codex.project_memory_dir(args.project)
         try:
+            if args.viewport:
+                app.set_viewport(args.viewport)
             res = runtime.check_harness(args.harness, app, extra_sys_path=mem_dir)
             print(json.dumps(res, indent=2))
             return 0
@@ -166,6 +170,8 @@ def main(argv: list[str] | None = None) -> int:
         app = App(engine, mode="episode")
         mem_dir = codex.project_memory_dir(args.project)
         try:
+            if args.viewport:
+                app.set_viewport(args.viewport)
             res = runtime.run_harness(
                 args.harness,
                 app,

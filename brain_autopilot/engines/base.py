@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
@@ -22,6 +23,11 @@ class AppEngine:
         self._screen_texts: dict[str, str] = {}
         self._console_errors: list[str] = []
         self._network_errors: list[dict[str, Any]] = []
+        self._network_log: list[dict[str, Any]] = []
+        self._dialogs: list[dict[str, Any]] = []
+        self._occlusion_events: list[dict[str, Any]] = []
+        self._aria_snapshot: str = ""
+        self._viewport: tuple[int, int] = (1280, 800)
         self._metrics: dict[str, Any] = {
             "cls": 0.0,
             "fps": 60.0,
@@ -44,19 +50,39 @@ class AppEngine:
     def get_ui_elements(self) -> list[dict[str, Any]]:
         return [dict(el) for el in self._ui_elements]
 
-    def _find_ui_element(self, selector_or_id: str) -> dict[str, Any] | None:
+    _FILLABLE_ROLES = frozenset({"input", "textarea", "select", "textbox", "combobox", "searchbox", "spinbutton"})
+
+    def _find_ui_element(self, selector_or_id: str, prefer_fillable: bool = False) -> dict[str, Any] | None:
         target = str(selector_or_id or "").strip()
         if not target:
             return None
-        for el in self._ui_elements:
-            if target in (el.get("id"), el.get("selector"), el.get("label"), el.get("test_id")):
-                return el
-        low = target.lower()
-        for el in self._ui_elements:
-            label = str(el.get("label") or "").lower()
-            if label and (label == low or low in label):
-                return el
-        return None
+        ref_target = target[4:] if target.lower().startswith("ref=") else target
+
+        def _search(pool: list[dict[str, Any]]) -> dict[str, Any] | None:
+            for el in pool:
+                if target in (el.get("id"), el.get("selector"), el.get("label"), el.get("test_id"), el.get("ref")):
+                    return el
+                if el.get("ref") and ref_target.lower() == str(el.get("ref")).lower():
+                    return el
+            low = target.lower()
+            for el in pool:
+                label = str(el.get("label") or "").lower()
+                if label and (label == low or low in label):
+                    return el
+            return None
+
+        if prefer_fillable:
+            fillable = [
+                el
+                for el in self._ui_elements
+                if str(el.get("role") or "").lower() in self._FILLABLE_ROLES
+                or str(el.get("kind") or "").lower() in self._FILLABLE_ROLES
+                or bool(el.get("contenteditable"))
+            ]
+            hit = _search(fillable)
+            if hit is not None:
+                return hit
+        return _search(self._ui_elements)
 
     def element_exists(self, selector_or_id: str) -> bool:
         if self._find_ui_element(selector_or_id) is not None:
@@ -87,6 +113,53 @@ class AppEngine:
     def get_network_errors(self) -> list[dict[str, Any]]:
         return list(self._network_errors)
 
+    def get_network_log(self) -> list[dict[str, Any]]:
+        return list(self._network_log)
+
+    def get_dialogs(self) -> list[dict[str, Any]]:
+        return list(self._dialogs)
+
+    def get_occlusion_events(self) -> list[dict[str, Any]]:
+        return list(self._occlusion_events)
+
+    def get_aria_snapshot(self) -> str:
+        if self._aria_snapshot:
+            return self._aria_snapshot
+        lines: list[str] = []
+        for idx, el in enumerate(self._ui_elements[:100], 1):
+            role = el.get("role") or el.get("kind") or "element"
+            label = el.get("label") or ""
+            ref = el.get("ref") or f"e{idx}"
+            lines.append(f'- {role} "{label}" [ref={ref}]')
+        return "\n".join(lines)
+
+    def set_viewport(
+        self,
+        width_or_preset: int | str,
+        height: int | None = None,
+        mobile: bool = False,
+        device_scale_factor: float = 1.0,
+    ) -> tuple[int, int]:
+        if isinstance(width_or_preset, str):
+            presets = {"mobile": (375, 812), "android": (360, 800), "tablet": (768, 1024), "desktop": (1280, 800)}
+            key = width_or_preset.strip().lower()
+            if key in presets:
+                w, h = presets[key]
+            else:
+                m = re.fullmatch(r"(\d+)x(\d+)", key)
+                if not m:
+                    raise ValueError(f"Unknown viewport preset: {width_or_preset!r}")
+                w, h = int(m.group(1)), int(m.group(2))
+        else:
+            w = int(width_or_preset)
+            h = int(height) if height is not None else self._viewport[1]
+        if w <= 0 or h <= 0:
+            raise ValueError(f"Viewport dimensions must be positive: ({w}, {h})")
+        if float(device_scale_factor) <= 0:
+            raise ValueError(f"Viewport device_scale_factor must be positive: {device_scale_factor}")
+        self._viewport = (w, h)
+        return self._viewport
+
     def get_metrics(self) -> dict[str, Any]:
         return dict(self._metrics)
 
@@ -99,7 +172,7 @@ class AppEngine:
         return True
 
     def act_on_ui(self, id_or_selector: str, action: str = "click", value: Any = None) -> bool:
-        el = self._find_ui_element(id_or_selector)
+        el = self._find_ui_element(id_or_selector, prefer_fillable=(action in ("fill", "set", "select")))
         if el is None:
             return False
         if not el.get("enabled", True) and action in ("click", "submit", "tap"):
@@ -127,6 +200,9 @@ class AppEngine:
         self._state.clear()
         self._console_errors.clear()
         self._network_errors.clear()
+        self._network_log.clear()
+        self._dialogs.clear()
+        self._occlusion_events.clear()
         return True
 
     def set_state_direct(self, path: str, prop: str, value: Any, why: str = "") -> bool:

@@ -102,9 +102,26 @@ TOOL_SPECS: list[tuple[str, str, dict[str, Any], bool]] = [
     ),
     (
         "snapshot",
-        "Return current route, visible screen texts, interactive UI elements, console errors, network errors, metrics, and detector findings.",
+        "Return current route, compact Playwright-style ARIA ref tree (`aria_snapshot`), visible screen texts, "
+        "interactive UI elements (including Shadow DOM refs), console/network errors, dialogs, metrics, and detector findings.",
         {"type": "object", "properties": {}},
         True,
+    ),
+    (
+        "set_viewport",
+        "Resize the live browser viewport using a responsive preset (`mobile`, `android`, `tablet`, `desktop`, or `WxH`) "
+        "or explicit `width`/`height` dimensions.",
+        {
+            "type": "object",
+            "properties": {
+                "preset": {"type": "string", "description": "Preset name (`mobile`, `android`, `tablet`, `desktop`) or `WxH`"},
+                "width": {"type": "integer"},
+                "height": {"type": "integer"},
+                "mobile": {"type": "boolean"},
+                "device_scale_factor": {"type": "number"},
+            },
+        },
+        False,
     ),
     (
         "describe_frames",
@@ -190,6 +207,9 @@ TOOL_SPECS: list[tuple[str, str, dict[str, Any], bool]] = [
         False,
     ),
 ]
+
+
+_KNOWN_TOOLS: frozenset[str] = frozenset(spec[0] for spec in TOOL_SPECS)
 
 
 def _text(msg: str, error: bool = False) -> dict[str, Any]:
@@ -314,6 +334,9 @@ class MCPServer:
             diag = doctor.diagnose(fix=bool(args.get("fix", False)))
             return _text(json.dumps(diag, indent=2))
 
+        if name not in _KNOWN_TOOLS:
+            return _text(f"Unknown tool: {name}", error=True)
+
         if self.session is None:
             return _text("No active run. Call `start_run` first.", error=True)
 
@@ -322,15 +345,34 @@ class MCPServer:
             snap = s.redactor.data(
                 {
                     "route": s.app.route(),
+                    "aria_snapshot": s.app.aria_snapshot(),
                     "screen": s.app.screen(),
                     "ui": s.app.ui(),
                     "console_errors": s.app.console_errors(),
                     "network_errors": s.app.network_errors(),
+                    "network_log": s.app.network_log()[-20:],
+                    "dialogs": s.app.dialogs(),
+                    "occlusion_events": s.app.occlusion_events(),
                     "metrics": s.app.metrics(),
                     "findings": s.app.findings(mem_dir=s.mem_dir),
                 }
             )
             return _text(json.dumps(snap, indent=2))
+
+        if name == "set_viewport":
+            preset = args.get("preset")
+            if preset:
+                w, h = s.app.set_viewport(str(preset))
+            elif args.get("width") is not None:
+                w, h = s.app.set_viewport(
+                    int(args["width"]),
+                    height=int(args["height"]) if args.get("height") is not None else None,
+                    mobile=bool(args.get("mobile", False)),
+                    device_scale_factor=float(args.get("device_scale_factor", 1.0)),
+                )
+            else:
+                return _text("set_viewport requires either `preset` or `width`.", error=True)
+            return _text(json.dumps({"viewport": [w, h], "metrics": s.app.metrics()}, indent=2))
 
         if name == "probe":
             s.app.mode = "probe"
@@ -425,6 +467,11 @@ class MCPServer:
             report_file = os.path.join(s.run_dir, "report.json")
             with open(report_file, "w", encoding="utf-8") as fh:
                 json.dump(report_data, fh, indent=2)
+            try:
+                html_path = report_html.generate_html(s.run_dir)
+                report_data["report_html"] = s.redactor.text(html_path)
+            except Exception:  # noqa: BLE001
+                pass
             return _text(f"Reported. Saved to {report_file}\n" + json.dumps(report_data, indent=2))
 
         return _text(f"Unknown tool: {name}", error=True)
@@ -442,10 +489,14 @@ class MCPServer:
                 )
             else:
                 box: dict[str, Any] = {}
-                thread = threading.Thread(
-                    target=lambda: box.update(result=self.execute_tool(name, args or {})),
-                    daemon=True,
-                )
+
+                def _run_tool(tool_name: str = name, tool_args: dict[str, Any] = args or {}) -> None:
+                    try:
+                        box["result"] = self.execute_tool(tool_name, tool_args)
+                    except Exception as exc:  # noqa: BLE001
+                        box["result"] = _text(f"{tool_name} failed: {type(exc).__name__}: {exc}", error=True)
+
+                thread = threading.Thread(target=_run_tool, daemon=True)
                 thread.start()
                 pending = self.pending = (thread, box, name, time.time())
 

@@ -21,6 +21,7 @@ from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urlparse
 
+from .. import __version__
 from .base import AppEngine
 from .cdp import CDPSession, find_browser_binary
 
@@ -29,6 +30,7 @@ class _DOMExtractor(HTMLParser):
     """Lightweight HTML DOM parser extracting interactive controls and visible text blocks."""
 
     INTERACTIVE_TAGS = {"button", "a", "input", "select", "textarea"}
+    VOID_TAGS = {"input", "img", "br", "hr", "meta", "link", "area", "base", "col", "embed", "param", "source", "track", "wbr"}
 
     def __init__(self) -> None:
         super().__init__()
@@ -36,38 +38,58 @@ class _DOMExtractor(HTMLParser):
         self.texts: dict[str, str] = {}
         self.broken_images = 0
         self._current: dict[str, Any] | None = None
+        self._current_tag: str | None = None
+        self._current_depth: int = 0
         self._text_idx = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag_low = tag.lower()
+        if self._current is not None and tag_low == self._current_tag:
+            self._current_depth += 1
         attr_map = {k.lower(): (v or "") for k, v in attrs}
         role = attr_map.get("role", "")
-        test_id = attr_map.get("data-testid") or attr_map.get("data-test") or ""
+        data_testid = attr_map.get("data-testid") or ""
+        data_test = attr_map.get("data-test") or ""
+        test_id = data_testid or data_test
         el_id = attr_map.get("id") or test_id or attr_map.get("name") or ""
+        is_ce = "contenteditable" in attr_map and attr_map["contenteditable"].lower() != "false"
         is_interactive = (
-            tag.lower() in self.INTERACTIVE_TAGS
+            tag_low in self.INTERACTIVE_TAGS
+            or is_ce
             or role in ("button", "link", "checkbox", "tab", "menuitem")
             or bool(test_id)
         )
         if is_interactive:
-            selector = (
-                f"[data-testid='{test_id}']"
-                if test_id
-                else (f"#{el_id}" if el_id else f"{tag.lower()}[{len(self.elements)}]")
-            )
+            ref = f"e{len(self.elements) + 1}"
+            if data_testid:
+                selector = f"[data-testid='{data_testid}']"
+            elif data_test:
+                selector = f"[data-test='{data_test}']"
+            elif el_id:
+                selector = f"#{el_id}"
+            else:
+                selector = f"{tag_low}[{len(self.elements)}]"
             item = {
+                "ref": ref,
                 "id": el_id or selector,
                 "selector": selector,
                 "test_id": test_id,
-                "kind": role or tag.lower(),
-                "role": role or tag.lower(),
+                "kind": role or tag_low,
+                "role": role or ("textbox" if is_ce else tag_low),
                 "label": attr_map.get("aria-label") or attr_map.get("placeholder") or "",
                 "enabled": "disabled" not in attr_map,
                 "visible": True,
+                "in_shadow": False,
+                "in_frame": False,
+                "contenteditable": is_ce,
                 "value": attr_map.get("value", ""),
                 "href": attr_map.get("href", ""),
             }
             self.elements.append(item)
-            self._current = item
+            if tag_low not in self.VOID_TAGS:
+                self._current = item
+                self._current_tag = tag_low
+                self._current_depth = 1
 
     def handle_data(self, data: str) -> None:
         cleaned = " ".join(data.split())
@@ -79,8 +101,12 @@ class _DOMExtractor(HTMLParser):
         self.texts[f"text_{self._text_idx}"] = cleaned
 
     def handle_endtag(self, tag: str) -> None:
-        if self._current is not None and tag.lower() in self.INTERACTIVE_TAGS:
-            self._current = None
+        if self._current is not None and tag.lower() == self._current_tag:
+            self._current_depth -= 1
+            if self._current_depth <= 0:
+                self._current = None
+                self._current_tag = None
+                self._current_depth = 0
 
 
 def _is_tcp_reachable(url: str, timeout: float = 0.4) -> bool:
@@ -114,6 +140,7 @@ class WebEngine(AppEngine):
         self._cdp: CDPSession | None = shared_cdp
         self._owns_cdp: bool = shared_cdp is None
         self._dirty: bool = False
+        self._pending_viewport: tuple[int | str, int | None, bool, float] | None = None
 
     def _should_use_cdp(self, target_url: str) -> bool:
         if self.use_cdp is False:
@@ -128,9 +155,13 @@ class WebEngine(AppEngine):
 
     def _ensure_cdp(self) -> CDPSession:
         if self._cdp is None:
-            self._cdp = CDPSession()
+            self._cdp = CDPSession(viewport=self._viewport)
         if not self._cdp.connected:
             self._cdp.start()
+        if self._pending_viewport is not None:
+            w_or_p, h, mob, dpr = self._pending_viewport
+            self._pending_viewport = None
+            self._viewport = self._cdp.set_viewport(w_or_p, height=h, mobile=mob, device_scale_factor=dpr)
         return self._cdp
 
     def _sync_from_cdp(self, force: bool = False) -> None:
@@ -143,11 +174,19 @@ class WebEngine(AppEngine):
         if snap:
             self._route = str(snap.get("route") or self._route)
             self._ui_elements = list(snap.get("elements") or [])
+            self._aria_snapshot = str(snap.get("aria_snapshot") or "")
             self._screen_texts = dict(snap.get("texts") or {})
             metrics = snap.get("metrics") or {}
             self._metrics.update(metrics)
-        self._console_errors = list(self._cdp.console_errors)
-        self._network_errors = list(self._cdp.network_errors)
+        with self._cdp._lock:
+            self._console_errors = list(self._cdp.console_errors)
+            self._network_errors = list(self._cdp.network_errors)
+            self._network_log = list(self._cdp.network_log)
+            self._dialogs = list(self._cdp.dialogs)
+            self._occlusion_events = list(self._cdp.occlusion_events)
+        self._metrics["pending_requests"] = self._cdp.pending_request_count()
+        self._metrics["dialogs_count"] = len(self._dialogs)
+        self._metrics["occluded_actions"] = len(self._occlusion_events)
 
     def load_html(self, html: str, route: str | None = None) -> None:
         """Parse `html` in memory and populate `self._ui_elements` and `self._screen_texts`."""
@@ -156,6 +195,7 @@ class WebEngine(AppEngine):
         parser = _DOMExtractor()
         parser.feed(html)
         self._ui_elements = parser.elements
+        self._aria_snapshot = ""
         self._screen_texts = parser.texts
 
     def get_route(self) -> str:
@@ -170,16 +210,16 @@ class WebEngine(AppEngine):
         self._sync_from_cdp()
         return [dict(el) for el in self._ui_elements]
 
+    def get_aria_snapshot(self) -> str:
+        self._sync_from_cdp()
+        return super().get_aria_snapshot()
+
     def element_exists(self, selector_or_id: str) -> bool:
         self._sync_from_cdp()
         if super().element_exists(selector_or_id):
             return True
         if self._cdp is not None and self._cdp.connected:
-            found = self._cdp.eval_js(
-                f"(() => {{ try {{ return Boolean(document.querySelector({json.dumps(selector_or_id)})); }} "
-                f"catch (_) {{ return false; }} }})()"
-            )
-            return bool(found)
+            return self._cdp.element_exists(selector_or_id)
         return False
 
     def get_property(self, selector_or_path: str, prop: str = "text") -> Any:
@@ -187,31 +227,65 @@ class WebEngine(AppEngine):
         val = super().get_property(selector_or_path, prop=prop)
         if val is not None or self._cdp is None or not self._cdp.connected:
             return val
-        js = f"""
-        (() => {{
-          const q = {json.dumps(selector_or_path)};
-          const p = {json.dumps(prop)};
-          let el = null;
-          try {{ el = document.querySelector(q); }} catch (_) {{}}
-          if (!el) el = document.getElementById(q);
-          if (!el) return null;
-          if (p === 'text') return (el.innerText || el.textContent || '').trim();
-          if (p === 'value') return el.value !== undefined ? el.value : null;
-          if (p === 'disabled') return Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true');
-          return el.getAttribute(p);
-        }})()
-        """
-        return self._cdp.eval_js(js)
+        return self._cdp.get_property(selector_or_path, prop=prop)
 
     def get_console_errors(self) -> list[str]:
         if self._cdp is not None and self._cdp.connected:
-            return list(self._cdp.console_errors)
+            with self._cdp._lock:
+                return list(self._cdp.console_errors)
         return list(self._console_errors)
 
     def get_network_errors(self) -> list[dict[str, Any]]:
         if self._cdp is not None and self._cdp.connected:
-            return list(self._cdp.network_errors)
+            with self._cdp._lock:
+                return list(self._cdp.network_errors)
         return list(self._network_errors)
+
+    def get_network_log(self) -> list[dict[str, Any]]:
+        if self._cdp is not None and self._cdp.connected:
+            with self._cdp._lock:
+                return list(self._cdp.network_log)
+        return list(self._network_log)
+
+    def get_dialogs(self) -> list[dict[str, Any]]:
+        if self._cdp is not None and self._cdp.connected:
+            with self._cdp._lock:
+                return list(self._cdp.dialogs)
+        return list(self._dialogs)
+
+    def get_occlusion_events(self) -> list[dict[str, Any]]:
+        if self._cdp is not None and self._cdp.connected:
+            with self._cdp._lock:
+                return list(self._cdp.occlusion_events)
+        return list(self._occlusion_events)
+
+    def set_viewport(
+        self,
+        width_or_preset: int | str,
+        height: int | None = None,
+        mobile: bool = False,
+        device_scale_factor: float = 1.0,
+    ) -> tuple[int, int]:
+        if self._cdp is not None and self._cdp.connected:
+            self._pending_viewport = None
+            size = self._cdp.set_viewport(
+                width_or_preset,
+                height=height,
+                mobile=mobile,
+                device_scale_factor=device_scale_factor,
+            )
+            self._viewport = size
+            self._dirty = True
+            self._sync_from_cdp(force=True)
+            return size
+        size = super().set_viewport(
+            width_or_preset,
+            height=height,
+            mobile=mobile,
+            device_scale_factor=device_scale_factor,
+        )
+        self._pending_viewport = (width_or_preset, height, mobile, device_scale_factor)
+        return size
 
     def get_metrics(self) -> dict[str, Any]:
         self._sync_from_cdp()
@@ -241,7 +315,7 @@ class WebEngine(AppEngine):
             return True
 
         try:
-            req = urllib.request.Request(target_url, headers={"User-Agent": "BrainAutopilot/2.0"})
+            req = urllib.request.Request(target_url, headers={"User-Agent": f"BrainAutopilot/{__version__}"})
             with urllib.request.urlopen(req, timeout=5) as resp:
                 status = getattr(resp, "status", 200)
                 body = resp.read().decode("utf-8", errors="replace")
@@ -258,9 +332,16 @@ class WebEngine(AppEngine):
     def act_on_ui(self, id_or_selector: str, action: str = "click", value: Any = None) -> bool:
         if self._cdp is not None and self._cdp.connected:
             self._sync_from_cdp()
-            el = self._find_ui_element(id_or_selector)
-            target = (el.get("selector") if el else None) or id_or_selector
-            if action in ("fill", "set", "select"):
+            is_fill = action in ("fill", "set", "select")
+            el = self._find_ui_element(id_or_selector, prefer_fillable=is_fill)
+            raw_target = str(id_or_selector or "").strip()
+            if raw_target.lower().startswith("ref=") or (el and raw_target.lower() == str(el.get("ref") or "").lower()):
+                target = raw_target
+            elif el and (el.get("in_shadow") or el.get("in_frame")) and el.get("ref"):
+                target = str(el["ref"])
+            else:
+                target = (el.get("selector") if el else None) or id_or_selector
+            if is_fill:
                 ok = self._cdp.fill(target, str(value or ""))
             elif action in ("click", "tap", "submit"):
                 ok = self._cdp.click(target)
@@ -292,18 +373,21 @@ class WebEngine(AppEngine):
         deadline = time.monotonic() + max(0.1, timeout)
         prev_sig = ""
         while time.monotonic() < deadline:
+            pending = self._cdp.pending_request_count()
             sig = str(
                 self._cdp.eval_js(
                     "document.readyState + ':' + (document.body ? document.body.innerText.length : 0)"
                 )
                 or ""
             )
-            if sig == prev_sig and sig.startswith("complete:"):
+            if pending == 0 and sig == prev_sig and sig.startswith("complete:"):
                 self._dirty = True
+                self._sync_from_cdp(force=True)
                 return True
             prev_sig = sig
             time.sleep(0.08)
         self._dirty = True
+        self._sync_from_cdp(force=True)
         return False
 
     def capture_frame(self, label: str = "") -> bytes | None:
@@ -318,9 +402,21 @@ class WebEngine(AppEngine):
         target_route = route or "/"
         super().restart(route=target_route)
         if self._cdp is not None and self._cdp.connected:
-            self._cdp.console_errors.clear()
-            self._cdp.network_errors.clear()
-            self._cdp.eval_js("try { localStorage.clear(); sessionStorage.clear(); } catch (_) {}")
+            with self._cdp._lock:
+                self._cdp.console_errors.clear()
+                self._cdp.network_errors.clear()
+                self._cdp.network_log.clear()
+                self._cdp.dialogs.clear()
+                self._cdp.occlusion_events.clear()
+                self._cdp._in_flight_requests.clear()
+            try:
+                self._cdp.eval_js("try { localStorage.clear(); sessionStorage.clear(); } catch (_) {}")
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._cdp.call("Network.clearBrowserCookies", timeout=3.0)
+            except Exception:  # noqa: BLE001
+                pass
             return self.navigate(target_route)
         if route is not None and self._should_use_cdp(self._resolve_url(target_route)):
             return self.navigate(target_route)

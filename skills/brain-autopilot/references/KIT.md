@@ -9,21 +9,26 @@
 ### Privileged Reads & Clock
 - `app.route() -> str`: current URL path or mobile screen route.
 - `app.screen() -> dict[str, str]`: visible text blocks currently rendered on screen.
-- `app.ui() -> list[dict]`: interactive controls currently on screen:
-  `[{"id", "selector", "test_id", "kind", "role", "label", "enabled", "visible", "value", "bounds", "touch_target_ok"}]`.
-- `app.exists(selector_or_id) -> bool`: whether the target element or text is currently rendered.
+- `app.ui() -> list[dict]`: interactive controls currently on screen (including Shadow DOM & snapshot `ref` IDs):
+  `[{"ref", "id", "selector", "test_id", "kind", "role", "label", "enabled", "visible", "in_shadow", "value", "bounds", "touch_target_ok"}]`.
+- `app.aria_snapshot() -> str`: compact Playwright-MCP-style ARIA tree with `[ref=eN]` handles (`- button "Add Item" [ref=e2]`).
+- `app.exists(selector_or_id) -> bool`: whether the target element (`ref=eN`, CSS selector, `#id`, `data-testid`, accessible name, or Shadow DOM control) or text is currently rendered.
 - `app.get(selector_or_path, prop="text") -> Any`: read `"text"`, `"value"`, `"disabled"`, `"bounds"`, or state property.
-- `app.console_errors() -> list[str]`: uncaught JS exceptions, console errors, or Android `logcat *:E` errors.
+- `app.console_errors() -> list[str]`: uncaught JS exceptions, React hydration warnings, or runtime errors logged by the app.
 - `app.network_errors() -> list[dict]`: HTTP `4xx`/`5xx` or failed network requests during the episode.
-- `app.metrics() -> dict`: `{"cls", "fps", "overflow_elements", "touch_target_violations", "broken_images", "draw_calls", "triangles", "canvas_present", "canvas_blank", "webgl_errors"}`.
+- `app.network_log() -> list[dict]`: recent HTTP/XHR/fetch requests with `url`, `method`, `status`, `resource_type`, and `duration_ms`.
+- `app.dialogs() -> list[dict]`: JavaScript `alert`/`confirm`/`prompt` dialogs automatically intercepted without deadlocking CDP.
+- `app.occlusion_events() -> list[dict]`: clicks rejected by Playwright-style `elementFromPoint` occlusion checks.
+- `app.metrics() -> dict`: `{"cls", "fps", "overflow_elements", "touch_target_violations", "broken_images", "missing_alt_images", "unlabeled_controls", "duplicate_ids", "shadow_roots", "pending_requests", "draw_calls", "triangles", "canvas_present", "canvas_blank", "webgl_errors"}`.
 - `app.findings(mem_dir=None) -> list[dict]`: evaluate active bug detectors (respecting `detectors.json` mute rules).
+- `app.set_viewport(width_or_preset, height=None, mobile=False, device_scale_factor=1.0) -> tuple[int, int]`: resize viewport (`"mobile"`, `"android"`, `"tablet"`, `"desktop"`, `"WxH"`, or explicit dimensions) via CDP Emulation.
 - `app.clock() -> AppClock`: app/render-clock stopwatch (`elapsed()`, `step()`, `since()`).
 - `app.batch([lambda: ..., lambda: ...]) -> list`: execute multiple reads in one logical step.
 
 ### User Inputs (The Only Way to Act in Episodes)
 - `app.navigate(route_or_url) -> bool`: navigate to a route, URL, or Android deep link.
-- `app.click(selector) -> bool`: click or tap an interactive element (by CSS selector, `#id`, `data-testid`, `aria-label`, or visible text).
-- `app.fill(selector, text) -> bool`: fill text into an input or textarea (React/Vue controlled-input safe over CDP; `adb input text` on Android).
+- `app.click(selector) -> bool`: click or tap an interactive element (by `ref=eN`/`eN`, CSS selector, `#id`, `data-testid`, `<label for>`/`aria-label`, or visible text — including open Shadow DOM, with `elementFromPoint` occlusion guard).
+- `app.fill(selector, text) -> bool`: fill text into an input, textarea, select, or `contenteditable="true"` editor (React/Vue controlled-input safe over CDP; `adb input text` on Android).
 - `app.ui_act(id, action="click"|"fill"|"select"|"submit"|"tap", value=..., text=...) -> bool`: act on an item from `app.ui()`.
 - `app.press(key) -> bool`: press keyboard or mobile key (`"Enter"`, `"Escape"`, `"Tab"`, `"BACK"`).
 - `app.scroll(dx=0, dy=400) -> bool`: scroll viewport or swipe mobile screen.

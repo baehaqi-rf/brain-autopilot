@@ -7,9 +7,9 @@ import json
 from pathlib import Path
 
 from brain_autopilot import bench, detectors, mcp, memory, regress, runtime, workflows
-from brain_autopilot.engines import WebEngine, WebGL3DEngine
+from brain_autopilot.engines import WebEngine
 from brain_autopilot.engines.cdp import find_browser_binary
-from brain_autopilot.kit import App, AppClock, Harness, Option, Result, Status, Step, retry, run
+from brain_autopilot.kit import App, AppClock, Result, retry, run
 
 
 def test_detectors_and_mute_preserved_across_forget(tmp_path: Path) -> None:

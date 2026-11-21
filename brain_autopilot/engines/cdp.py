@@ -117,86 +117,227 @@ TELEMETRY_INIT_JS = r"""
 
 DOM_SNAPSHOT_JS = r"""
 (() => {
-  const INTERACTIVE_SEL = 'button, a[href], input, select, textarea, [role="button"], [role="link"], [role="tab"], [role="checkbox"], [role="menuitem"], [data-testid], [data-test]';
-  const nodes = Array.from(document.querySelectorAll(INTERACTIVE_SEL));
-  const elements = [];
-  const seen = new Set();
-  let touchViolations = 0;
+  const INTERACTIVE_SEL = 'button, a[href], input, select, textarea, [contenteditable]:not([contenteditable="false"]), [role="button"], [role="link"], [role="tab"], [role="checkbox"], [role="switch"], [role="menuitem"], [role="combobox"], [data-testid], [data-test]';
 
   function cssEscape(s) {
     return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
   }
 
+  function cssIdSelector(rawId) {
+    if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
+      return '#' + CSS.escape(rawId);
+    }
+    return `[id='${cssEscape(rawId)}']`;
+  }
+
+  function collectRoots(root, out, visited, inShadow, inFrame, frameChain) {
+    if (!root || visited.has(root)) return;
+    visited.add(root);
+    out.push({ root, inShadow: Boolean(inShadow), inFrame: Boolean(inFrame), frameChain: frameChain || [] });
+    const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+    for (const el of all) {
+      if (el.shadowRoot) {
+        collectRoots(el.shadowRoot, out, visited, true, inFrame, frameChain || []);
+      }
+      const tag = el.tagName ? el.tagName.toUpperCase() : '';
+      if (tag === 'IFRAME' || tag === 'FRAME') {
+        try {
+          const doc = el.contentDocument;
+          if (doc) collectRoots(doc, out, visited, false, true, (frameChain || []).concat(el));
+        } catch (_) {}
+      }
+    }
+  }
+
+  function absRect(el, frameChain) {
+    const r = el.getBoundingClientRect();
+    let left = r.left;
+    let top = r.top;
+    for (const fr of (frameChain || [])) {
+      const frRect = fr.getBoundingClientRect();
+      const frWin = (fr.ownerDocument && fr.ownerDocument.defaultView) || window;
+      const frStyle = frWin.getComputedStyle(fr);
+      left += frRect.left + (parseFloat(frStyle.borderLeftWidth) || 0) + (parseFloat(frStyle.paddingLeft) || 0);
+      top += frRect.top + (parseFloat(frStyle.borderTopWidth) || 0) + (parseFloat(frStyle.paddingTop) || 0);
+    }
+    return { left, top, width: r.width, height: r.height };
+  }
+
   function isVisible(el, rect) {
     if (!el) return false;
-    const style = window.getComputedStyle(el);
+    const win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+    const style = win.getComputedStyle(el);
     if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
     return rect.width > 0 && rect.height > 0;
   }
 
-  for (let i = 0; i < nodes.length && elements.length < 150; i++) {
-    const el = nodes[i];
-    if (seen.has(el)) continue;
-    seen.add(el);
-    const rect = el.getBoundingClientRect();
-    const visible = isVisible(el, rect);
-    const tag = el.tagName.toLowerCase();
-    const role = el.getAttribute('role') || '';
-    const testId = el.getAttribute('data-testid') || el.getAttribute('data-test') || '';
-    const rawId = el.id || '';
-    const nameAttr = el.getAttribute('name') || '';
-    const elId = rawId || testId || nameAttr;
-    let selector = '';
-    if (testId) selector = `[data-testid='${cssEscape(testId)}']`;
-    else if (rawId) selector = `#${cssEscape(rawId)}`;
-    else selector = `${tag}[data-ba-idx='${i}']`;
-    el.setAttribute('data-ba-idx', String(i));
+  function accessibleName(el, root) {
+    const ownerDoc = el.ownerDocument || document;
+    const ariaLabel = (el.getAttribute('aria-label') || '').trim();
+    if (ariaLabel) return ariaLabel;
 
-    const label = (
-      el.getAttribute('aria-label') ||
-      el.getAttribute('placeholder') ||
-      el.innerText ||
-      el.textContent ||
-      ''
-    ).replace(/\s+/g, ' ').trim().slice(0, 120);
-
-    const enabled = !el.disabled && el.getAttribute('aria-disabled') !== 'true';
-    const w = Math.round(rect.width);
-    const h = Math.round(rect.height);
-    const touchOk = !visible || (w >= 44 && h >= 44);
-    if (visible && (tag === 'button' || tag === 'a' || role === 'button' || role === 'link') && (w < 44 || h < 44)) {
-      touchViolations++;
+    const labelledBy = (el.getAttribute('aria-labelledby') || '').trim();
+    if (labelledBy) {
+      const parts = [];
+      for (const id of labelledBy.split(/\s+/)) {
+        const refEl = (root && root.getElementById ? root.getElementById(id) : null) || ownerDoc.getElementById(id);
+        if (refEl) {
+          const t = (refEl.innerText || refEl.textContent || '').trim();
+          if (t) parts.push(t);
+        }
+      }
+      if (parts.length) return parts.join(' ');
     }
-    elements.push({
-      id: elId || selector,
-      selector,
-      test_id: testId,
-      kind: role || tag,
-      role: role || tag,
-      label,
-      enabled,
-      visible,
-      value: typeof el.value === 'string' ? el.value : '',
-      href: el.getAttribute('href') || '',
-      bounds: [Math.round(rect.left), Math.round(rect.top), w, h],
-      touch_target_ok: touchOk,
-    });
+
+    if (el.labels && el.labels.length) {
+      const parts = [];
+      for (const lbl of el.labels) {
+        const t = (lbl.innerText || lbl.textContent || '').trim();
+        if (t) parts.push(t);
+      }
+      if (parts.length) return parts.join(' ');
+    }
+
+    if (el.id) {
+      try {
+        const lbl = (root && root.querySelector ? root.querySelector(`label[for='${cssEscape(el.id)}']`) : null)
+          || ownerDoc.querySelector(`label[for='${cssEscape(el.id)}']`);
+        if (lbl) {
+          const t = (lbl.innerText || lbl.textContent || '').trim();
+          if (t) return t;
+        }
+      } catch (_) {}
+    }
+
+    const wrapLabel = el.closest ? el.closest('label') : null;
+    if (wrapLabel) {
+      const t = (wrapLabel.innerText || wrapLabel.textContent || '').trim();
+      if (t) return t;
+    }
+
+    const placeholder = (el.getAttribute('placeholder') || '').trim();
+    if (placeholder) return placeholder;
+
+    const title = (el.getAttribute('title') || '').trim();
+    if (title) return title;
+
+    const alt = (el.getAttribute('alt') || '').trim();
+    if (alt) return alt;
+
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'input' && ['button', 'submit', 'reset'].includes((el.type || '').toLowerCase()) && el.value) {
+      return String(el.value).trim();
+    }
+
+    const text = (el.innerText || el.textContent || '').trim();
+    return text;
+  }
+
+  const roots = [];
+  collectRoots(document, roots, new Set(), false, false, []);
+
+  const elements = [];
+  const ariaLines = [];
+  const seen = new Set();
+  let touchViolations = 0;
+  let refCounter = 0;
+
+  for (const entry of roots) {
+    const root = entry.root;
+    const inShadow = entry.inShadow;
+    const inFrame = entry.inFrame;
+    const nodes = Array.from(root.querySelectorAll(INTERACTIVE_SEL));
+    for (let i = 0; i < nodes.length && elements.length < 180; i++) {
+      const el = nodes[i];
+      if (seen.has(el)) continue;
+      seen.add(el);
+      const rect = absRect(el, entry.frameChain);
+      const visible = isVisible(el, rect);
+      const tag = el.tagName.toLowerCase();
+      const role = el.getAttribute('role') || (
+        el.isContentEditable ? 'textbox' :
+        (tag === 'input' ? (el.type === 'checkbox' ? 'checkbox' : 'textbox') : (tag === 'a' ? 'link' : tag))
+      );
+      const dataTestId = el.getAttribute('data-testid') || '';
+      const dataTest = el.getAttribute('data-test') || '';
+      const testId = dataTestId || dataTest;
+      const rawId = el.id || '';
+      const nameAttr = el.getAttribute('name') || '';
+      const elId = rawId || testId || nameAttr;
+
+      refCounter++;
+      const ref = `e${refCounter}`;
+      el.setAttribute('data-ba-ref', ref);
+      el.setAttribute('data-ba-idx', String(refCounter - 1));
+
+      let selector = '';
+      if (dataTestId) selector = `[data-testid='${cssEscape(dataTestId)}']`;
+      else if (dataTest) selector = `[data-test='${cssEscape(dataTest)}']`;
+      else if (rawId) selector = cssIdSelector(rawId);
+      else selector = `${tag}[data-ba-ref='${ref}']`;
+
+      const label = accessibleName(el, root).replace(/\s+/g, ' ').trim().slice(0, 120);
+      const enabled = !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+      const w = Math.round(rect.width);
+      const h = Math.round(rect.height);
+      const touchOk = !visible || (w >= 44 && h >= 44);
+      if (visible && (tag === 'button' || tag === 'a' || role === 'button' || role === 'link') && (w < 44 || h < 44)) {
+        touchViolations++;
+      }
+
+      const val = typeof el.value === 'string'
+        ? el.value
+        : (el.isContentEditable ? (el.innerText || '').trim() : '');
+
+      elements.push({
+        ref,
+        id: elId || selector,
+        selector,
+        test_id: testId,
+        kind: el.getAttribute('role') || tag,
+        role,
+        label,
+        enabled,
+        visible,
+        in_shadow: inShadow,
+        in_frame: inFrame,
+        contenteditable: Boolean(el.isContentEditable),
+        value: val,
+        href: el.getAttribute('href') || '',
+        bounds: [Math.round(rect.left), Math.round(rect.top), w, h],
+        touch_target_ok: touchOk,
+      });
+
+      if (visible && ariaLines.length < 100) {
+        const flags = [];
+        if (!enabled) flags.push('disabled');
+        if (inShadow) flags.push('shadow');
+        if (inFrame) flags.push('frame');
+        if (val && (tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable)) {
+          flags.push(`value="${String(val).slice(0, 40)}"`);
+        }
+        const suffix = flags.length ? ` (${flags.join(', ')})` : '';
+        ariaLines.push(`- ${role} "${label}" [ref=${ref}]${suffix}`);
+      }
+    }
   }
 
   const texts = {};
   let tIdx = 0;
-  const textNodes = document.querySelectorAll('h1, h2, h3, h4, p, label, [role="alert"], [role="status"], [data-testid]');
-  for (const node of textNodes) {
-    if (tIdx >= 80) break;
-    const rect = node.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) continue;
-    const txt = (node.innerText || '').replace(/\s+/g, ' ').trim();
-    if (!txt) continue;
-    const key = node.getAttribute('data-testid') || node.id || `text_${++tIdx}`;
-    if (!(key in texts)) texts[key] = txt.slice(0, 300);
+  for (const entry of roots) {
+    const textNodes = entry.root.querySelectorAll('h1, h2, h3, h4, p, label, [role="alert"], [role="status"], [data-testid]');
+    for (const node of textNodes) {
+      if (tIdx >= 80) break;
+      const rect = node.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) continue;
+      const txt = (node.innerText || '').replace(/\s+/g, ' ').trim();
+      if (!txt) continue;
+      const key = node.getAttribute('data-testid') || node.id || `text_${++tIdx}`;
+      if (!(key in texts)) texts[key] = txt.slice(0, 300);
+    }
   }
 
-  const vw = window.innerWidth || document.documentElement.clientWidth || 1280;
+  const vw = document.documentElement.clientWidth || window.innerWidth || 1280;
   let overflowCount = 0;
   if (document.documentElement.scrollWidth > vw + 2) {
     for (const el of document.querySelectorAll('*')) {
@@ -211,25 +352,40 @@ DOM_SNAPSHOT_JS = r"""
 
   let brokenImages = 0;
   let missingAltImages = 0;
-  for (const img of document.querySelectorAll('img')) {
-    if (img.complete && img.naturalWidth === 0) brokenImages++;
-    if (!img.hasAttribute('alt')) missingAltImages++;
+  for (const entry of roots) {
+    for (const img of entry.root.querySelectorAll('img')) {
+      if (img.complete && img.naturalWidth === 0) brokenImages++;
+      if (!img.hasAttribute('alt')) missingAltImages++;
+    }
   }
 
   let unlabeledControls = 0;
   for (const el of elements) {
     if (!el.visible) continue;
-    if (!el.label) unlabeledControls++;
+    const isNativeControl = ['button', 'a', 'input', 'select', 'textarea', 'link', 'textbox', 'checkbox', 'switch', 'combobox', 'tab', 'menuitem'].includes(el.role) || ['button', 'a', 'input', 'select', 'textarea'].includes(el.kind);
+    if (isNativeControl && !el.label) unlabeledControls++;
+  }
+
+  const idCounts = Object.create(null);
+  let duplicateIds = 0;
+  for (const el of document.querySelectorAll('[id]')) {
+    const id = (el.id || '').trim();
+    if (!id) continue;
+    idCounts[id] = (idCounts[id] || 0) + 1;
+    if (idCounts[id] === 2) duplicateIds++;
   }
 
   const canvases = Array.from(document.querySelectorAll('canvas'));
   const domNodes = document.querySelectorAll('*').length;
+  const shadowRootsCount = roots.filter((r) => r.inShadow).length;
+  const sameOriginFramesCount = roots.filter((r) => r.inFrame).length;
 
   return {
     url: location.href,
     route: location.pathname + location.search + location.hash,
     title: document.title || '',
     elements,
+    aria_snapshot: ariaLines.join('\n'),
     texts,
     metrics: {
       cls: Math.round((window.__ba_cls || 0) * 10000) / 10000,
@@ -237,8 +393,11 @@ DOM_SNAPSHOT_JS = r"""
       broken_images: brokenImages,
       missing_alt_images: missingAltImages,
       unlabeled_controls: unlabeledControls,
+      duplicate_ids: duplicateIds,
       touch_target_violations: touchViolations,
       dom_nodes: domNodes,
+      shadow_roots: shadowRootsCount,
+      same_origin_frames: sameOriginFramesCount,
       lcp_ms: Math.round(window.__ba_lcp || 0),
       fps: window.__ba_fps || 60,
       scene_objects: canvases.length,
@@ -246,6 +405,13 @@ DOM_SNAPSHOT_JS = r"""
   };
 })()
 """
+
+VIEWPORT_PRESETS: dict[str, tuple[int, int, bool, float]] = {
+    "mobile": (375, 812, True, 2.0),
+    "android": (360, 800, True, 2.0),
+    "tablet": (768, 1024, True, 2.0),
+    "desktop": (1280, 800, False, 1.0),
+}
 
 
 def find_browser_binary() -> str | None:
@@ -396,12 +562,168 @@ _KEY_CODES: dict[str, tuple[str, int]] = {
     "esc": ("Escape", 27),
     "tab": ("Tab", 9),
     "backspace": ("Backspace", 8),
+    "delete": ("Delete", 46),
+    "home": ("Home", 36),
+    "end": ("End", 35),
+    "pageup": ("PageUp", 33),
+    "pagedown": ("PageDown", 34),
     "space": (" ", 32),
     "arrowdown": ("ArrowDown", 40),
     "arrowup": ("ArrowUp", 38),
     "arrowleft": ("ArrowLeft", 37),
     "arrowright": ("ArrowRight", 39),
 }
+
+_STREAMING_RESOURCE_TYPES: frozenset[str] = frozenset({"eventsource", "websocket"})
+_FILLABLE_SELECTOR = 'input, textarea, select, [contenteditable]:not([contenteditable="false"])'
+
+
+_FIND_ELEMENT_JS_FN = r"""
+  function _baCssEscape(s) {
+    return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  }
+  function _baCollectRoots(root, out, visited, frameChain) {
+    if (!root || visited.has(root)) return;
+    visited.add(root);
+    out.push({ root, frameChain: frameChain || [] });
+    const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+    for (const el of all) {
+      if (el.shadowRoot) {
+        _baCollectRoots(el.shadowRoot, out, visited, frameChain || []);
+      }
+      const tag = el.tagName ? el.tagName.toUpperCase() : '';
+      if (tag === 'IFRAME' || tag === 'FRAME') {
+        try {
+          const doc = el.contentDocument;
+          if (doc) _baCollectRoots(doc, out, visited, (frameChain || []).concat(el));
+        } catch (_) {}
+      }
+    }
+  }
+  function _baAbsRect(el, frameChain) {
+    const r = el.getBoundingClientRect();
+    let left = r.left;
+    let top = r.top;
+    for (const fr of (frameChain || [])) {
+      const frRect = fr.getBoundingClientRect();
+      const frWin = (fr.ownerDocument && fr.ownerDocument.defaultView) || window;
+      const frStyle = frWin.getComputedStyle(fr);
+      left += frRect.left + (parseFloat(frStyle.borderLeftWidth) || 0) + (parseFloat(frStyle.paddingLeft) || 0);
+      top += frRect.top + (parseFloat(frStyle.borderTopWidth) || 0) + (parseFloat(frStyle.paddingTop) || 0);
+    }
+    return { left, top, width: r.width, height: r.height };
+  }
+  function _baAccessibleName(el, root) {
+    const ownerDoc = el.ownerDocument || document;
+    const aria = (el.getAttribute('aria-label') || '').trim();
+    if (aria) return aria;
+    const lby = (el.getAttribute('aria-labelledby') || '').trim();
+    if (lby) {
+      const parts = [];
+      for (const id of lby.split(/\s+/)) {
+        const refEl = (root && root.getElementById ? root.getElementById(id) : null) || ownerDoc.getElementById(id);
+        if (refEl) {
+          const t = (refEl.innerText || refEl.textContent || '').trim();
+          if (t) parts.push(t);
+        }
+      }
+      if (parts.length) return parts.join(' ');
+    }
+    if (el.labels && el.labels.length) {
+      const parts = [];
+      for (const lbl of el.labels) {
+        const t = (lbl.innerText || lbl.textContent || '').trim();
+        if (t) parts.push(t);
+      }
+      if (parts.length) return parts.join(' ');
+    }
+    if (el.id) {
+      try {
+        const lbl = (root && root.querySelector ? root.querySelector(`label[for='${_baCssEscape(el.id)}']`) : null)
+          || ownerDoc.querySelector(`label[for='${_baCssEscape(el.id)}']`);
+        if (lbl) {
+          const t = (lbl.innerText || lbl.textContent || '').trim();
+          if (t) return t;
+        }
+      } catch (_) {}
+    }
+    const wrap = el.closest ? el.closest('label') : null;
+    if (wrap) {
+      const t = (wrap.innerText || wrap.textContent || '').trim();
+      if (t) return t;
+    }
+    return (
+      el.getAttribute('placeholder') ||
+      el.getAttribute('title') ||
+      el.getAttribute('alt') ||
+      el.innerText ||
+      el.textContent ||
+      ''
+    ).replace(/\s+/g, ' ').trim();
+  }
+  function _baFindElementEntry(query, candidateSelector) {
+    const raw = String(query || '').trim();
+    if (!raw) return null;
+    const roots = [];
+    _baCollectRoots(document, roots, new Set(), []);
+
+    // 1. Playwright-style snapshot ref (`e12` or `ref=e12`)
+    const refMatch = /^(?:ref=)?(e\d+)$/i.exec(raw);
+    if (refMatch) {
+      const refSel = `[data-ba-ref='${_baCssEscape(refMatch[1].toLowerCase())}']`;
+      for (const entry of roots) {
+        const found = entry.root.querySelector(refSel);
+        if (found) return { el: found, root: entry.root, frameChain: entry.frameChain };
+      }
+    }
+
+    // 2. Direct CSS selector across document, open shadow roots, and same-origin iframes
+    for (const entry of roots) {
+      try {
+        const found = entry.root.querySelector(raw);
+        if (found) return { el: found, root: entry.root, frameChain: entry.frameChain };
+      } catch (_) {
+        // Handle unescaped special-character IDs like `#:r0:` (React useId)
+        if (raw.startsWith('#') && !/[\s>+~[\],]/.test(raw)) {
+          const idPart = raw.slice(1);
+          const byId = entry.root.getElementById
+            ? entry.root.getElementById(idPart)
+            : entry.root.querySelector(`[id='${_baCssEscape(idPart)}']`);
+          if (byId) return { el: byId, root: entry.root, frameChain: entry.frameChain };
+        }
+      }
+    }
+
+    // 3. Exact id / data-testid / data-test / name across document, shadow roots & same-origin iframes
+    const esc = _baCssEscape(raw);
+    for (const entry of roots) {
+      let found = null;
+      if (entry.root.getElementById) found = entry.root.getElementById(raw);
+      if (!found) {
+        found = entry.root.querySelector(`[data-testid='${esc}'], [data-test='${esc}'], [name='${esc}']`);
+      }
+      if (found) return { el: found, root: entry.root, frameChain: entry.frameChain };
+    }
+
+    // 4. Accessible name exact match then substring match
+    const low = raw.toLowerCase();
+    const sel = candidateSelector || 'button, a, input, select, textarea, [contenteditable]:not([contenteditable="false"]), [role]';
+    let partial = null;
+    for (const entry of roots) {
+      for (const cand of entry.root.querySelectorAll(sel)) {
+        const txt = _baAccessibleName(cand, entry.root).toLowerCase();
+        if (!txt) continue;
+        if (txt === low) return { el: cand, root: entry.root, frameChain: entry.frameChain };
+        if (!partial && txt.includes(low)) partial = { el: cand, root: entry.root, frameChain: entry.frameChain };
+      }
+    }
+    return partial;
+  }
+  function _baFindElement(query, candidateSelector) {
+    const entry = _baFindElementEntry(query, candidateSelector);
+    return entry ? entry.el : null;
+  }
+"""
 
 
 class CDPSession:
@@ -410,6 +732,9 @@ class CDPSession:
     def __init__(self, browser_path: str | None = None, viewport: tuple[int, int] = (1280, 800)) -> None:
         self.browser_path = browser_path or find_browser_binary()
         self.viewport = viewport
+        self._default_viewport = viewport
+        self._viewport_overridden = False
+        self._pending_viewport_spec: tuple[int, int, bool, float] | None = None
         self._proc: subprocess.Popen[bytes] | None = None
         self._user_data_dir: str | None = None
         self._ws: _WebSocketClient | None = None
@@ -417,8 +742,14 @@ class CDPSession:
         self._ids = itertools.count(1)
         self._lock = threading.Lock()
         self._pending: dict[int, tuple[threading.Event, dict[str, Any]]] = {}
+        self._in_flight_requests: dict[str, dict[str, Any]] = {}
         self.console_errors: list[str] = []
         self.network_errors: list[dict[str, Any]] = []
+        self.network_log: list[dict[str, Any]] = []
+        self.dialogs: list[dict[str, Any]] = []
+        self.occlusion_events: list[dict[str, Any]] = []
+        self.auto_dialog_action: str = "accept"
+        self.auto_dialog_prompt: str = ""
         self.current_url: str = "about:blank"
 
     @property
@@ -490,6 +821,19 @@ class CDPSession:
             self.call(domain)
         self.call("Page.addScriptToEvaluateOnNewDocument", {"source": TELEMETRY_INIT_JS})
         self.eval_js(TELEMETRY_INIT_JS)
+        if self._pending_viewport_spec is not None:
+            pw, ph, pmob, pdpr = self._pending_viewport_spec
+            self._pending_viewport_spec = None
+            self.call(
+                "Emulation.setDeviceMetricsOverride",
+                {
+                    "width": pw,
+                    "height": ph,
+                    "deviceScaleFactor": pdpr,
+                    "mobile": pmob,
+                },
+            )
+            self._viewport_overridden = True
 
     def _read_loop(self) -> None:
         ws = self._ws
@@ -514,36 +858,188 @@ class CDPSession:
             elif "method" in msg:
                 self._handle_event(msg["method"], msg.get("params") or {})
 
+    def _handle_dialog_async(self, accept: bool, prompt_text: str) -> None:
+        try:
+            params: dict[str, Any] = {"accept": accept}
+            if prompt_text:
+                params["promptText"] = prompt_text
+            self.call("Page.handleJavaScriptDialog", params, timeout=3.0)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _handle_event(self, method: str, params: dict[str, Any]) -> None:
         if method == "Runtime.consoleAPICalled":
             if params.get("type") == "error":
                 args = params.get("args") or []
                 txt = " ".join(str(a.get("value") or a.get("description") or "") for a in args).strip()
                 if txt:
-                    self.console_errors.append(txt[:300])
+                    with self._lock:
+                        self.console_errors.append(txt[:300])
         elif method == "Runtime.exceptionThrown":
             details = params.get("exceptionDetails") or {}
             exc = details.get("exception") or {}
             txt = exc.get("description") or details.get("text") or "Uncaught JS exception"
-            self.console_errors.append(str(txt)[:300])
+            with self._lock:
+                self.console_errors.append(str(txt)[:300])
         elif method == "Log.entryAdded":
             entry = params.get("entry") or {}
             if entry.get("level") == "error":
-                self.console_errors.append(str(entry.get("text") or "Browser log error")[:300])
+                with self._lock:
+                    self.console_errors.append(str(entry.get("text") or "Browser log error")[:300])
+        elif method == "Network.requestWillBeSent":
+            req_id = str(params.get("requestId") or "")
+            req = params.get("request") or {}
+            res_type = str(params.get("type") or "")
+            if req_id and res_type.lower() not in _STREAMING_RESOURCE_TYPES:
+                with self._lock:
+                    prev = self._in_flight_requests.get(req_id)
+                    self._in_flight_requests[req_id] = {
+                        "url": str(req.get("url") or ""),
+                        "method": str(req.get("method") or "GET"),
+                        "resource_type": res_type,
+                        "start": prev["start"] if prev else time.monotonic(),
+                        "status": 0,
+                    }
         elif method == "Network.responseReceived":
+            req_id = str(params.get("requestId") or "")
             resp = params.get("response") or {}
             status = int(resp.get("status") or 0)
-            if status >= 400:
-                self.network_errors.append({"url": resp.get("url", ""), "status": status})
+            url = str(resp.get("url") or "")
+            mime = str(resp.get("mimeType") or "").lower()
+            with self._lock:
+                if req_id and req_id in self._in_flight_requests:
+                    if mime == "text/event-stream":
+                        self._in_flight_requests.pop(req_id, None)
+                    else:
+                        self._in_flight_requests[req_id]["status"] = status
+                        if url:
+                            self._in_flight_requests[req_id]["url"] = url
+                if status >= 400:
+                    self.network_errors.append({"url": url, "status": status})
+        elif method == "Network.loadingFinished":
+            req_id = str(params.get("requestId") or "")
+            with self._lock:
+                item = self._in_flight_requests.pop(req_id, None) if req_id else None
+                if item is not None:
+                    duration_ms = round((time.monotonic() - item["start"]) * 1000.0, 1)
+                    self.network_log.append(
+                        {
+                            "url": item["url"],
+                            "method": item["method"],
+                            "resource_type": item["resource_type"],
+                            "status": item["status"],
+                            "duration_ms": duration_ms,
+                            "failed": False,
+                        }
+                    )
+                    if len(self.network_log) > 200:
+                        del self.network_log[:-200]
         elif method == "Network.loadingFailed":
-            if not params.get("canceled"):
-                self.network_errors.append(
-                    {"url": params.get("type", "request"), "status": 0, "error": params.get("errorText", "failed")}
+            req_id = str(params.get("requestId") or "")
+            err_txt = str(params.get("errorText") or "failed")
+            with self._lock:
+                item = self._in_flight_requests.pop(req_id, None) if req_id else None
+                if item is not None:
+                    duration_ms = round((time.monotonic() - item["start"]) * 1000.0, 1)
+                    self.network_log.append(
+                        {
+                            "url": item["url"],
+                            "method": item["method"],
+                            "resource_type": item["resource_type"],
+                            "status": item["status"],
+                            "duration_ms": duration_ms,
+                            "failed": True,
+                            "error": err_txt,
+                        }
+                    )
+                    if len(self.network_log) > 200:
+                        del self.network_log[:-200]
+                if not params.get("canceled"):
+                    url = (item or {}).get("url") or params.get("type", "request")
+                    self.network_errors.append({"url": url, "status": 0, "error": err_txt})
+        elif method == "Page.javascriptDialogOpening":
+            action = self.auto_dialog_action
+            with self._lock:
+                self.dialogs.append(
+                    {
+                        "type": str(params.get("type") or "alert"),
+                        "message": str(params.get("message") or "")[:300],
+                        "url": str(params.get("url") or ""),
+                        "handled": action,
+                    }
                 )
+            threading.Thread(
+                target=self._handle_dialog_async,
+                args=(action != "dismiss", self.auto_dialog_prompt),
+                daemon=True,
+            ).start()
         elif method == "Page.frameNavigated":
             frame = params.get("frame") or {}
             if not frame.get("parentId") and frame.get("url"):
                 self.current_url = str(frame["url"])
+
+    def pending_request_count(self) -> int:
+        """Number of currently in-flight HTTP/XHR/fetch requests."""
+        with self._lock:
+            return len(self._in_flight_requests)
+
+    def wait_for_network_idle(self, timeout: float = 2.0, idle_ms: int = 120) -> bool:
+        """Wait until zero network requests are in-flight continuously for `idle_ms`."""
+        deadline = time.monotonic() + max(0.05, float(timeout))
+        quiet_since: float | None = None
+        idle_s = max(0.02, float(idle_ms) / 1000.0)
+        while time.monotonic() < deadline:
+            if self.pending_request_count() == 0:
+                if quiet_since is None:
+                    quiet_since = time.monotonic()
+                elif (time.monotonic() - quiet_since) >= idle_s:
+                    return True
+            else:
+                quiet_since = None
+            time.sleep(0.03)
+        return self.pending_request_count() == 0
+
+    def set_viewport(
+        self,
+        width_or_preset: int | str,
+        height: int | None = None,
+        mobile: bool = False,
+        device_scale_factor: float = 1.0,
+    ) -> tuple[int, int]:
+        """Resize viewport or apply a responsive preset (`mobile`, `android`, `tablet`, `desktop`)."""
+        if isinstance(width_or_preset, str):
+            key = width_or_preset.strip().lower()
+            if key in VIEWPORT_PRESETS:
+                w, h, mobile, device_scale_factor = VIEWPORT_PRESETS[key]
+            else:
+                m = re.fullmatch(r"(\d+)x(\d+)", key)
+                if not m:
+                    raise ValueError(f"Unknown viewport preset: {width_or_preset!r}")
+                w, h = int(m.group(1)), int(m.group(2))
+                mobile = w <= 768
+        else:
+            w = int(width_or_preset)
+            h = int(height) if height is not None else self.viewport[1]
+        if w <= 0 or h <= 0:
+            raise ValueError(f"Viewport dimensions must be positive: ({w}, {h})")
+        if float(device_scale_factor) <= 0:
+            raise ValueError(f"Viewport device_scale_factor must be positive: {device_scale_factor}")
+        self.viewport = (w, h)
+        if self.connected:
+            self._pending_viewport_spec = None
+            self.call(
+                "Emulation.setDeviceMetricsOverride",
+                {
+                    "width": w,
+                    "height": h,
+                    "deviceScaleFactor": float(device_scale_factor),
+                    "mobile": bool(mobile),
+                },
+            )
+            self._viewport_overridden = True
+        else:
+            self._pending_viewport_spec = (w, h, bool(mobile), float(device_scale_factor))
+        return self.viewport
 
     def call(self, method: str, params: dict[str, Any] | None = None, timeout: float = 10.0) -> dict[str, Any]:
         ws = self._ws
@@ -575,16 +1071,17 @@ class CDPSession:
             return None
         return (res.get("result") or {}).get("value")
 
-    def navigate(self, url: str, wait_settle: float = 0.25) -> bool:
+    def navigate(self, url: str, wait_settle: float = 0.25, wait_load: bool = True) -> bool:
         self.start()
         self.call("Page.navigate", {"url": url}, timeout=15.0)
-        deadline = time.monotonic() + 8.0
-        while time.monotonic() < deadline:
-            ready = self.eval_js("document.readyState")
-            if ready in ("interactive", "complete"):
-                break
-            time.sleep(0.05)
-        self.eval_js(TELEMETRY_INIT_JS)
+        if wait_load:
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline:
+                ready = self.eval_js("document.readyState")
+                if ready in ("interactive", "complete"):
+                    break
+                time.sleep(0.05)
+            self.eval_js(TELEMETRY_INIT_JS)
         if wait_settle > 0:
             time.sleep(wait_settle)
         return True
@@ -595,35 +1092,122 @@ class CDPSession:
         data = self.eval_js(DOM_SNAPSHOT_JS)
         return data if isinstance(data, dict) else {}
 
-    def _locate_js(self, target: str) -> dict[str, Any] | None:
+    def element_exists(self, target: str) -> bool:
+        js = f"(() => {{{_FIND_ELEMENT_JS_FN} return Boolean(_baFindElement({json.dumps(target)})); }})()"
+        return bool(self.eval_js(js))
+
+    def get_property(self, target: str, prop: str = "text") -> Any:
         js = f"""
         (() => {{
-          const q = {json.dumps(target)};
-          let el = null;
-          try {{ el = document.querySelector(q); }} catch (_) {{}}
-          if (!el) {{
-            el = document.getElementById(q) || document.querySelector(`[data-testid='${{q.replace(/'/g, "\\\\'")}}']`);
+          {_FIND_ELEMENT_JS_FN}
+          const el = _baFindElement({json.dumps(target)});
+          if (!el) return null;
+          const p = {json.dumps(prop)};
+          if (p === 'text') return (el.innerText || el.textContent || '').trim();
+          if (p === 'value') {{
+            if (el.value !== undefined) return el.value;
+            if (el.isContentEditable) return (el.innerText || '').trim();
+            return null;
           }}
-          if (!el) {{
-            const low = q.toLowerCase();
-            for (const cand of document.querySelectorAll('button, a, input, select, textarea, [role]')) {{
-              const txt = (cand.getAttribute('aria-label') || cand.getAttribute('placeholder') || cand.innerText || '').trim().toLowerCase();
-              if (txt === low || txt.includes(low)) {{ el = cand; break; }}
+          if (p === 'disabled') return Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true');
+          return el.getAttribute(p);
+        }})()
+        """
+        return self.eval_js(js)
+
+    def _locate_js(self, target: str, candidate_selector: str | None = None) -> dict[str, Any] | None:
+        cand_arg = json.dumps(candidate_selector) if candidate_selector is not None else "null"
+        js = f"""
+        (() => {{
+          {_FIND_ELEMENT_JS_FN}
+          const found = _baFindElementEntry({json.dumps(target)}, {cand_arg});
+          if (!found || !found.el) return null;
+          const el = found.el;
+          const frameChain = found.frameChain || [];
+          for (const fr of frameChain) {{
+            if (fr && fr.scrollIntoView) fr.scrollIntoView({{ block: 'center', inline: 'center' }});
+          }}
+          if (el.scrollIntoView) el.scrollIntoView({{ block: 'center', inline: 'center' }});
+          const win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+          const style = win.getComputedStyle(el);
+          const r = _baAbsRect(el, frameChain);
+          const visible = style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0' && r.width > 0 && r.height > 0;
+          const disabled = Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true');
+          const cx = r.left + r.width / 2;
+          const cy = r.top + r.height / 2;
+          const vw = document.documentElement.clientWidth || window.innerWidth || 1280;
+          const vh = document.documentElement.clientHeight || window.innerHeight || 800;
+          const inViewport = cx >= 0 && cy >= 0 && cx <= vw && cy <= vh;
+          let occluded = false;
+          let occludedBy = '';
+          if (visible && inViewport) {{
+            let hit = document.elementFromPoint(cx, cy);
+            let localX = cx;
+            let localY = cy;
+            let guard = 0;
+            while (hit && guard++ < 12) {{
+              if (hit.shadowRoot) {{
+                const inner = hit.shadowRoot.elementFromPoint(localX, localY);
+                if (!inner || inner === hit) break;
+                hit = inner;
+                continue;
+              }}
+              const hTag = hit.tagName ? hit.tagName.toUpperCase() : '';
+              if (hTag === 'IFRAME' || hTag === 'FRAME') {{
+                try {{
+                  const fDoc = hit.contentDocument;
+                  if (!fDoc) break;
+                  const fRect = hit.getBoundingClientRect();
+                  const fWin = (hit.ownerDocument && hit.ownerDocument.defaultView) || window;
+                  const fStyle = fWin.getComputedStyle(hit);
+                  localX -= fRect.left + (parseFloat(fStyle.borderLeftWidth) || 0) + (parseFloat(fStyle.paddingLeft) || 0);
+                  localY -= fRect.top + (parseFloat(fStyle.borderTopWidth) || 0) + (parseFloat(fStyle.paddingTop) || 0);
+                  const inner = fDoc.elementFromPoint(localX, localY);
+                  if (!inner || inner === hit) break;
+                  hit = inner;
+                  continue;
+                }} catch (_) {{
+                  break;
+                }}
+              }}
+              break;
+            }}
+            if (hit && hit !== el && !el.contains(hit)) {{
+              const isWrappingLabel = hit.tagName && hit.tagName.toLowerCase() === 'label' && hit.contains(el);
+              if (!isWrappingLabel) {{
+                occluded = true;
+                occludedBy = hit.tagName.toLowerCase() + (hit.id ? '#' + hit.id : '') + (hit.className && typeof hit.className === 'string' ? '.' + hit.className.trim().split(/\\s+/).slice(0, 2).join('.') : '');
+              }}
             }}
           }}
-          if (!el) return null;
-          el.scrollIntoView({{ block: 'center', inline: 'center' }});
-          const r = el.getBoundingClientRect();
-          const disabled = Boolean(el.disabled || el.getAttribute('aria-disabled') === 'true');
-          return {{ x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height, disabled, tag: el.tagName.toLowerCase() }};
+          return {{
+            x: cx,
+            y: cy,
+            w: r.width,
+            h: r.height,
+            visible,
+            in_viewport: inViewport,
+            disabled,
+            occluded,
+            occluded_by: occludedBy,
+            tag: el.tagName.toLowerCase(),
+          }};
         }})()
         """
         val = self.eval_js(js)
         return val if isinstance(val, dict) else None
 
-    def click(self, target: str) -> bool:
+    def click(self, target: str, force: bool = False) -> bool:
         info = self._locate_js(target)
-        if not info or info.get("disabled"):
+        if not info or info.get("disabled") or not info.get("visible", True):
+            return False
+        if not info.get("in_viewport", True) and not force:
+            return False
+        if info.get("occluded") and not force:
+            with self._lock:
+                self.occlusion_events.append(
+                    {"target": str(target), "occluded_by": str(info.get("occluded_by") or "overlay")}
+                )
             return False
         x, y = float(info["x"]), float(info["y"])
         for kind in ("mouseMoved", "mousePressed", "mouseReleased"):
@@ -635,33 +1219,31 @@ class CDPSession:
         return True
 
     def fill(self, target: str, value: str) -> bool:
-        info = self._locate_js(target)
-        if not info or info.get("disabled"):
+        info = self._locate_js(target, candidate_selector=_FILLABLE_SELECTOR)
+        if not info or info.get("disabled") or not info.get("visible", True):
             return False
         js = f"""
         (() => {{
-          const q = {json.dumps(target)};
-          const val = {json.dumps(str(value))};
-          let el = null;
-          try {{ el = document.querySelector(q); }} catch (_) {{}}
-          if (!el) el = document.getElementById(q) || document.querySelector(`[data-testid='${{q.replace(/'/g, "\\\\'")}}']`);
-          if (!el) {{
-            const low = q.toLowerCase();
-            for (const cand of document.querySelectorAll('input, textarea, select')) {{
-              const txt = (cand.getAttribute('aria-label') || cand.getAttribute('placeholder') || cand.name || '').trim().toLowerCase();
-              if (txt === low || txt.includes(low)) {{ el = cand; break; }}
-            }}
-          }}
+          {_FIND_ELEMENT_JS_FN}
+          const el = _baFindElement({json.dumps(target)}, {json.dumps(_FILLABLE_SELECTOR)});
           if (!el) return false;
+          const val = {json.dumps(str(value))};
           el.focus();
           const tag = el.tagName.toLowerCase();
+          if (el.isContentEditable) {{
+            el.textContent = val;
+            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+            return true;
+          }}
           if (tag === 'select') {{
             el.value = val;
             el.dispatchEvent(new Event('input', {{ bubbles: true }}));
             el.dispatchEvent(new Event('change', {{ bubbles: true }}));
             return true;
           }}
-          const proto = tag === 'textarea' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+          const win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+          const proto = tag === 'textarea' ? win.HTMLTextAreaElement.prototype : win.HTMLInputElement.prototype;
           const desc = Object.getOwnPropertyDescriptor(proto, 'value');
           if (desc && desc.set) desc.set.call(el, val);
           else el.value = val;
@@ -675,21 +1257,30 @@ class CDPSession:
         return ok
 
     def press_key(self, key: str) -> bool:
-        name = str(key or "").strip()
+        raw = str(key or "")
+        name = "space" if raw == " " else raw.strip()
         if not name:
             return False
         mapped = _KEY_CODES.get(name.lower())
         key_val, vk = mapped if mapped else (name, ord(name[0].upper()) if len(name) == 1 else 0)
+        text_val = ""
+        if mapped is None and len(key_val) == 1:
+            text_val = key_val
+        elif key_val == " ":
+            text_val = " "
+        elif key_val == "Enter":
+            text_val = "\r"
         for kind in ("keyDown", "keyUp"):
-            self.call(
-                "Input.dispatchKeyEvent",
-                {
-                    "type": kind,
-                    "key": key_val,
-                    "windowsVirtualKeyCode": vk,
-                    "nativeVirtualKeyCode": vk,
-                },
-            )
+            params: dict[str, Any] = {
+                "type": kind,
+                "key": key_val,
+                "windowsVirtualKeyCode": vk,
+                "nativeVirtualKeyCode": vk,
+            }
+            if kind == "keyDown" and text_val:
+                params["text"] = text_val
+                params["unmodifiedText"] = text_val
+            self.call("Input.dispatchKeyEvent", params)
         return True
 
     def scroll(self, dx: int = 0, dy: int = 400) -> bool:
@@ -703,11 +1294,24 @@ class CDPSession:
         return base64.b64decode(b64) if b64 else None
 
     def reset_page(self) -> None:
-        """Cleanly reset page state, storage, cookies, and error buffers for warm session reuse."""
+        """Cleanly reset page state, storage, cookies, viewport, and telemetry buffers for warm session reuse."""
         if not self.connected:
             return
-        self.console_errors.clear()
-        self.network_errors.clear()
+        with self._lock:
+            self.console_errors.clear()
+            self.network_errors.clear()
+            self.network_log.clear()
+            self.dialogs.clear()
+            self.occlusion_events.clear()
+            self._in_flight_requests.clear()
+        self._pending_viewport_spec = None
+        if self._viewport_overridden:
+            try:
+                self.call("Emulation.clearDeviceMetricsOverride", timeout=3.0)
+            except Exception:  # noqa: BLE001
+                pass
+            self.viewport = self._default_viewport
+            self._viewport_overridden = False
         try:
             self.eval_js("try { localStorage.clear(); sessionStorage.clear(); } catch (_) {}")
         except Exception:  # noqa: BLE001
@@ -717,11 +1321,16 @@ class CDPSession:
         except Exception:  # noqa: BLE001
             pass
         try:
-            self.navigate("about:blank", wait_load=False)
+            self.navigate("about:blank", wait_settle=0.0, wait_load=False)
         except Exception:  # noqa: BLE001
             pass
-        self.console_errors.clear()
-        self.network_errors.clear()
+        with self._lock:
+            self.console_errors.clear()
+            self.network_errors.clear()
+            self.network_log.clear()
+            self.dialogs.clear()
+            self.occlusion_events.clear()
+            self._in_flight_requests.clear()
         self.current_url = "about:blank"
 
     def close(self) -> None:

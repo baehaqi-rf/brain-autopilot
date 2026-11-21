@@ -63,9 +63,15 @@ class App:
         return self.engine.get_screen_texts()
 
     def ui(self) -> list[dict[str, Any]]:
-        """Interactive UI elements currently on screen."""
+        """Interactive UI elements currently on screen (including Shadow DOM & snapshot `ref` IDs)."""
         self._tick_time()
         return self.engine.get_ui_elements()
+
+    def aria_snapshot(self) -> str:
+        """Compact Playwright-MCP-style ARIA tree with `[ref=eN]` handles for interactive controls."""
+        self._tick_time()
+        fn = getattr(self.engine, "get_aria_snapshot", None)
+        return str(fn()) if callable(fn) else ""
 
     def exists(self, selector_or_id: str) -> bool:
         """Whether an element or text matching `selector_or_id` is currently rendered."""
@@ -87,10 +93,45 @@ class App:
         self._tick_time()
         return list(self.engine.get_network_errors())
 
+    def network_log(self) -> list[dict[str, Any]]:
+        """Recent HTTP/XHR/fetch requests with method, status, resource_type, and duration_ms."""
+        self._tick_time()
+        fn = getattr(self.engine, "get_network_log", None)
+        return list(fn()) if callable(fn) else []
+
+    def dialogs(self) -> list[dict[str, Any]]:
+        """JavaScript `alert`/`confirm`/`prompt` dialogs automatically intercepted during the run."""
+        self._tick_time()
+        fn = getattr(self.engine, "get_dialogs", None)
+        return list(fn()) if callable(fn) else []
+
+    def occlusion_events(self) -> list[dict[str, Any]]:
+        """Interactive clicks rejected by Playwright-style `elementFromPoint` occlusion checks."""
+        self._tick_time()
+        fn = getattr(self.engine, "get_occlusion_events", None)
+        return list(fn()) if callable(fn) else []
+
     def metrics(self) -> dict[str, Any]:
         """Layout & runtime telemetry (`cls`, `fps`, `overflow_elements`, `touch_target_violations`, etc.)."""
         self._tick_time()
         return self.engine.get_metrics()
+
+    def set_viewport(
+        self,
+        width_or_preset: int | str,
+        height: int | None = None,
+        mobile: bool = False,
+        device_scale_factor: float = 1.0,
+    ) -> tuple[int, int]:
+        """Resize viewport or apply preset (`mobile`, `android`, `tablet`, `desktop`, or `WxH`)."""
+        self._tick_time()
+        self.action_log.append(
+            {"t": self.t, "action": "set_viewport", "target": width_or_preset, "height": height, "mobile": mobile}
+        )
+        fn = getattr(self.engine, "set_viewport", None)
+        if callable(fn):
+            return fn(width_or_preset, height=height, mobile=mobile, device_scale_factor=device_scale_factor)
+        return (1280, 800)
 
     def findings(self, mem_dir: str | None = None) -> list[dict[str, Any]]:
         """Evaluate bug detectors on current live telemetry (respecting `detectors.json` mute rules)."""

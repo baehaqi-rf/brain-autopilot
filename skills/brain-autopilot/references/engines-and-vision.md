@@ -16,11 +16,17 @@
 
 Detectors run automatically during `snapshot` and `run_harness`, producing structured findings (`detector`, `signature`, `severity`, `message`, `detail`):
 - `console_error`: uncaught JS exceptions, `console.error`, browser log errors, or `logcat *:E`.
+- `hydration_error`: React/Next.js SSR hydration mismatch errors in console output.
 - `network_error`: HTTP `4xx`/`5xx` or failed network fetches.
+- `slow_network`: HTTP/XHR/fetch requests exceeding `max_request_ms` (default `3000ms`).
+- `js_dialog_blocked`: unexpected blocking `alert`/`confirm`/`prompt` intercepted automatically by CDP.
+- `occluded_interactive`: click blocked because an overlaying element covered the target (`elementFromPoint`).
 - `layout_shift`: Cumulative Layout Shift (`CLS > 0.1`).
-- `horizontal_overflow`: elements exceeding viewport width.
+- `horizontal_overflow`: elements exceeding viewport width (at desktop or emulated mobile/tablet viewports).
 - `touch_target`: clickable controls smaller than `44x44px`.
 - `broken_image`: `<img>` elements with `complete && naturalWidth === 0`.
+- `a11y_missing_alt` / `a11y_unlabeled_control` / `a11y_duplicate_id`: WCAG accessibility checks (with full `<label for>` and `aria-labelledby` resolution).
+- `large_dom` / `slow_lcp`: performance guardrails (`dom_nodes > 3000`, `lcp_ms > 2500ms`).
 - `blank_canvas` / `webgl_error` / `low_fps`: 3D/WebGL render integrity checks.
 
 Mute false positives or disable detectors per project via `<memory_dir>/detectors.json` (never wiped by `memory.forget()`):

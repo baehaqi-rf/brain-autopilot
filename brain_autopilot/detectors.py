@@ -23,6 +23,7 @@ DEFAULT_MIN_TOUCH_PX = 44
 DEFAULT_MIN_FPS = 15.0
 DEFAULT_MAX_DOM_NODES = 3000
 DEFAULT_MAX_LCP_MS = 2500.0
+DEFAULT_MAX_REQUEST_MS = 3000.0
 
 
 def path(folder: str) -> str:
@@ -66,6 +67,7 @@ def config(folder: str | None) -> dict[str, Any]:
     out.setdefault("min_fps", DEFAULT_MIN_FPS)
     out.setdefault("max_dom_nodes", DEFAULT_MAX_DOM_NODES)
     out.setdefault("max_lcp_ms", DEFAULT_MAX_LCP_MS)
+    out.setdefault("max_request_ms", DEFAULT_MAX_REQUEST_MS)
     return out
 
 
@@ -155,6 +157,21 @@ def evaluate(app_or_engine: Any, folder: str | None = None) -> list[dict[str, An
         if hasattr(app_or_engine, "metrics")
         else app_or_engine.get_metrics()
     )
+    network_log = (
+        app_or_engine.network_log()
+        if hasattr(app_or_engine, "network_log")
+        else (app_or_engine.get_network_log() if hasattr(app_or_engine, "get_network_log") else [])
+    )
+    dialogs = (
+        app_or_engine.dialogs()
+        if hasattr(app_or_engine, "dialogs")
+        else (app_or_engine.get_dialogs() if hasattr(app_or_engine, "get_dialogs") else [])
+    )
+    occlusions = (
+        app_or_engine.occlusion_events()
+        if hasattr(app_or_engine, "occlusion_events")
+        else (app_or_engine.get_occlusion_events() if hasattr(app_or_engine, "get_occlusion_events") else [])
+    )
 
     findings: list[dict[str, Any]] = []
     seen_sigs: set[str] = set()
@@ -176,6 +193,10 @@ def evaluate(app_or_engine: Any, folder: str | None = None) -> list[dict[str, An
         text = str(err).strip()
         if not text:
             continue
+        low = text.lower()
+        if "hydration" in low or "did not match" in low or "text content does not match" in low:
+            sig_h = f"hydration_error:{text[:80]}"
+            add("hydration_error", sig_h, "error", f"Hydration mismatch error: {text}", text)
         sig = f"console_error:{text[:80]}"
         add("console_error", sig, "error", f"Console/runtime error: {text}", text)
 
@@ -185,6 +206,26 @@ def evaluate(app_or_engine: Any, folder: str | None = None) -> list[dict[str, An
         short = _short_url(url)
         sig = f"network_error:{status}:{short}"
         add("network_error", sig, "error", f"Network failure ({status}) on {short}", net)
+
+    max_req_ms = float(cfg.get("max_request_ms") or DEFAULT_MAX_REQUEST_MS)
+    for req in network_log or []:
+        dur = float(req.get("duration_ms") or 0.0)
+        if dur > max_req_ms and not req.get("failed"):
+            short = _short_url(str(req.get("url") or ""))
+            sig = f"slow_network:{short}"
+            add("slow_network", sig, "warning", f"Slow network request ({dur:.0f}ms > {max_req_ms:.0f}ms) on {short}", req)
+
+    for dlg in dialogs or []:
+        dtype = str(dlg.get("type") or "alert")
+        dmsg = str(dlg.get("message") or "").strip()
+        sig = f"js_dialog_blocked:{dtype}:{dmsg[:60]}"
+        add("js_dialog_blocked", sig, "warning", f"Blocking JS {dtype} dialog intercepted: {dmsg}", dlg)
+
+    for occ in occlusions or []:
+        target = str(occ.get("target") or "")
+        by = str(occ.get("occluded_by") or "overlay")
+        sig = f"occluded_interactive:{target[:60]}"
+        add("occluded_interactive", sig, "warning", f"Interactive target '{target}' occluded by {by}", occ)
 
     cls_val = float(metrics.get("cls") or 0.0)
     cls_max = float(cfg.get("cls_max") or DEFAULT_CLS_MAX)
@@ -233,6 +274,16 @@ def evaluate(app_or_engine: Any, folder: str | None = None) -> list[dict[str, An
             "warning",
             f"{unlabeled} interactive control(s) missing accessible name/label (WCAG 4.1.2)",
             unlabeled,
+        )
+
+    dup_ids = int(metrics.get("duplicate_ids") or 0)
+    if dup_ids > 0:
+        add(
+            "a11y_duplicate_id",
+            "a11y_duplicate_id:dom",
+            "warning",
+            f"{dup_ids} duplicate DOM id attribute(s) detected (breaks labels & ARIA references)",
+            dup_ids,
         )
 
     dom_nodes = int(metrics.get("dom_nodes") or 0)

@@ -1,6 +1,6 @@
 {
-  "name": "brain-autopilot-core-v3",
-  "description": "v3.0 Benchmark suite covering Live CDP Web, Bug & Accessibility/Performance Detectors, Warm CDP Session Reuse, Mobile XML Touch Audit, 3D Canvas, Blind Vision, Zero-LLM Regression Replay, Doctor Diagnostics, and Self-Contained HTML Reports.",
+  "name": "brain-autopilot-core-v3.1",
+  "description": "v3.1 Benchmark suite covering Live CDP Web, Shadow DOM & Playwright-style ARIA Refs, JS Dialog & Occlusion Guards, Responsive Viewport Emulation & Network Idle, Loop-Aware Decision Policy, Real PNG Frame Persistence & HTML Fidelity, Bug/A11y/Perf Detectors, Warm CDP Reuse, Mobile XML, 3D Canvas, Blind Vision, Zero-LLM Regression Replay, and Doctor Diagnostics.",
   "tasks": [
     {
       "id": "W1_checkout_and_regress",
@@ -23,6 +23,21 @@
       "description": "Verify warm shared CDPSession.reset_page() clears error/storage state cleanly between runs"
     },
     {
+      "id": "W5_shadow_dom_and_aria_refs",
+      "category": "playwright_mcp_parity",
+      "description": "Pierce open Shadow DOM Web Components, resolve Playwright-style ARIA refs (e1..eN), and verify zero false-positive unlabeled alerts on <label for>"
+    },
+    {
+      "id": "W6_dialog_and_occlusion_guard",
+      "category": "actionability_and_dialogs",
+      "description": "Reject clicks on overlay-occluded controls via elementFromPoint and auto-handle blocking JS alert dialogs without CDP deadlock"
+    },
+    {
+      "id": "W7_responsive_viewport_and_network_idle",
+      "category": "viewport_and_network",
+      "description": "Detect mobile-only horizontal overflow via Emulation.setDeviceMetricsOverride and await in-flight XHR/fetch completion in wait_settled()"
+    },
+    {
       "id": "M1_mobile_uiautomator_touch_audit",
       "category": "mobile_adb",
       "description": "Parse Android uiautomator XML and flag <44px touch target accessibility violations"
@@ -41,6 +56,11 @@
       "id": "E1_doctor_and_report_html",
       "category": "dx_and_reporting",
       "description": "Verify doctor IDE/typing diagnostics and zero-dependency self-contained HTML report generation"
+    },
+    {
+      "id": "R1_state_loop_escape_and_html_fidelity",
+      "category": "runtime_intelligence",
+      "description": "Verify loop-aware decision policy escapes no-op decoys, persists episode PNG frames, and renders real kind='decision' traces in report.html"
     }
   ]
 }

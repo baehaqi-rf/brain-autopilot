@@ -10,10 +10,8 @@ Benchmarked against `ramenvr/autopilot/bench/`, BU Bench, and Maestro flows:
 
 from __future__ import annotations
 
-import functools
 import http.server
 import json
-import os
 import socketserver
 import tempfile
 import threading
@@ -24,7 +22,7 @@ from typing import Any
 from . import detectors, doctor, memory, regress, report_html, runtime, vision
 from .engines import MobileEngine, WebEngine, WebGL3DEngine
 from .engines.cdp import CDPSession, find_browser_binary
-from .kit import App, Harness, Option, Result, Status, Step, click_and_wait, fill_form, navigate_to, submit_form_idempotent
+from .kit import App, Harness, Option, Result, Status, Step
 from .redact import Redactor
 
 _APP_HTML: dict[str, str] = {
@@ -93,6 +91,55 @@ _APP_HTML: dict[str, str] = {
   <button id="icon-only" style="min-width:48px;min-height:48px;"></button>
   <button id="good-btn" style="min-width:120px;min-height:48px;">Accessible Action</button>
 </body></html>""",
+    "/shadow": """<!doctype html>
+<html><head><title>Shadow DOM Bench</title></head>
+<body>
+  <h1>Shadow DOM &amp; Labels</h1>
+  <label for="full-name">Full Name</label>
+  <input id="full-name" />
+  <ba-shadow-widget></ba-shadow-widget>
+  <script>
+    class BaShadowWidget extends HTMLElement {
+      constructor() {
+        super();
+        const root = this.attachShadow({ mode: 'open' });
+        root.innerHTML = `
+          <input id="shadow-note" placeholder="Shadow Note" />
+          <button id="shadow-btn" style="min-width:120px;min-height:48px;">Shadow Submit</button>
+          <div id="shadow-out">IDLE</div>
+        `;
+        root.getElementById('shadow-btn').addEventListener('click', () => {
+          const v = root.getElementById('shadow-note').value || 'empty';
+          root.getElementById('shadow-out').textContent = 'SHADOW:' + v;
+        });
+      }
+    }
+    customElements.define('ba-shadow-widget', BaShadowWidget);
+  </script>
+</body></html>""",
+    "/dialog-occlusion": """<!doctype html>
+<html><head><title>Dialog &amp; Occlusion Bench</title></head>
+<body>
+  <button id="covered-btn" style="position:fixed;top:120px;left:120px;min-width:140px;min-height:48px;"
+    onclick="document.getElementById('covered-status').textContent='CLICKED';">Covered Action</button>
+  <button id="trigger-alert" style="position:fixed;top:200px;left:120px;min-width:140px;min-height:48px;"
+    onclick="window.alert('BENCH_ALERT_OK'); document.getElementById('alert-status').textContent='AFTER_ALERT';">Trigger Alert</button>
+  <div id="covered-status">WAITING</div>
+  <div id="alert-status">IDLE</div>
+  <div id="blocker" style="position:fixed;inset:0;z-index:999;background:rgba(0,0,0,0.4);"></div>
+  <button id="dismiss-blocker" style="position:fixed;top:16px;right:16px;z-index:1000;min-width:140px;min-height:48px;"
+    onclick="const b=document.getElementById('blocker'); if(b) b.remove();">Dismiss Overlay</button>
+</body></html>""",
+    "/responsive-async": """<!doctype html>
+<html><head><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Responsive &amp; Async Bench</title></head>
+<body style="margin:0;">
+  <div style="width:600px;height:40px;background:#eef;">Fixed 600px Card</div>
+  <button id="load-async" style="min-width:140px;min-height:48px;"
+    onclick="fetch('/api/delayed').then(r=>r.json()).then(d=>{document.getElementById('async-result').textContent=d.status;});">
+    Load Async Data
+  </button>
+  <div id="async-result">PENDING</div>
+</body></html>""",
 }
 
 
@@ -103,6 +150,15 @@ class _BenchHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(204)
             self.send_header("Content-Length", "0")
             self.end_headers()
+            return
+        if path == "/api/delayed":
+            time.sleep(0.25)
+            body = json.dumps({"status": "LOADED"}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         if path in _APP_HTML:
             body = _APP_HTML[path].encode("utf-8")
@@ -500,8 +556,209 @@ def _bench_e1_doctor_and_report_html() -> dict[str, Any]:
     }
 
 
+def _bench_w5_shadow_dom_and_aria_refs(
+    base_url: str,
+    live_cdp: bool,
+    shared_cdp: CDPSession | None = None,
+) -> dict[str, Any]:
+    t0 = time.monotonic()
+    engine = WebEngine(base_url=base_url, use_cdp=live_cdp, shared_cdp=shared_cdp)
+    app = App(engine, mode="probe")
+    try:
+        if live_cdp:
+            app.navigate("/shadow")
+            ui = app.ui()
+            aria = app.aria_snapshot()
+            shadow_btn = next((e for e in ui if e.get("in_shadow") and e.get("id") == "shadow-btn"), None)
+            shadow_inp = next((e for e in ui if e.get("in_shadow") and e.get("id") == "shadow-note"), None)
+            unlabeled = int(app.metrics().get("unlabeled_controls") or 0)
+            fill_ok = bool(shadow_inp and app.fill(str(shadow_inp["ref"]), "hello-shadow"))
+            click_ok = bool(shadow_btn and app.click(str(shadow_btn["ref"])))
+            out_txt = str(app.get("#shadow-out", "text") or "")
+            passed = (
+                shadow_btn is not None
+                and shadow_inp is not None
+                and "(shadow)" in aria
+                and unlabeled == 0
+                and fill_ok
+                and click_ok
+                and out_txt == "SHADOW:hello-shadow"
+            )
+        else:
+            engine.load_html('<label for="fn">Full Name</label><input id="fn" placeholder="Full Name" /><button id="b1">Go</button>')
+            aria = app.aria_snapshot()
+            passed = "[ref=e1]" in aria and app.click("e2")
+    finally:
+        app.close()
+    return {
+        "id": "W5_shadow_dom_and_aria_refs",
+        "mode": "cdp" if live_cdp else "offline",
+        "passed": bool(passed),
+        "seconds": round(time.monotonic() - t0, 2),
+    }
+
+
+def _bench_w6_dialog_and_occlusion_guard(
+    base_url: str,
+    live_cdp: bool,
+    shared_cdp: CDPSession | None = None,
+) -> dict[str, Any]:
+    t0 = time.monotonic()
+    engine = WebEngine(base_url=base_url, use_cdp=live_cdp, shared_cdp=shared_cdp)
+    app = App(engine, mode="probe")
+    try:
+        if live_cdp:
+            app.navigate("/dialog-occlusion")
+            blocked_click = app.click("#covered-btn")
+            occ_findings = {f["detector"] for f in app.findings()}
+            dismiss_ok = app.click("#dismiss-blocker")
+            unblocked_click = app.click("#covered-btn")
+            covered_status = str(app.get("#covered-status", "text") or "")
+            alert_click = app.click("#trigger-alert")
+            time.sleep(0.12)
+            alert_status = str(app.get("#alert-status", "text") or "")
+            dlgs = app.dialogs()
+            all_findings = {f["detector"] for f in app.findings()}
+            passed = (
+                blocked_click is False
+                and "occluded_interactive" in occ_findings
+                and dismiss_ok is True
+                and unblocked_click is True
+                and covered_status == "CLICKED"
+                and alert_click is True
+                and alert_status == "AFTER_ALERT"
+                and any("BENCH_ALERT_OK" in d.get("message", "") for d in dlgs)
+                and "js_dialog_blocked" in all_findings
+            )
+        else:
+            engine._dialogs.append({"type": "alert", "message": "BENCH_ALERT_OK", "handled": "accept"})
+            engine._occlusion_events.append({"target": "#covered-btn", "occluded_by": "div#blocker"})
+            sigs = {f["detector"] for f in app.findings()}
+            passed = {"js_dialog_blocked", "occluded_interactive"} <= sigs
+    finally:
+        app.close()
+    return {
+        "id": "W6_dialog_and_occlusion_guard",
+        "mode": "cdp" if live_cdp else "offline",
+        "passed": bool(passed),
+        "seconds": round(time.monotonic() - t0, 2),
+    }
+
+
+def _bench_w7_responsive_viewport_and_network_idle(
+    base_url: str,
+    live_cdp: bool,
+    shared_cdp: CDPSession | None = None,
+) -> dict[str, Any]:
+    t0 = time.monotonic()
+    engine = WebEngine(base_url=base_url, use_cdp=live_cdp, shared_cdp=shared_cdp)
+    app = App(engine, mode="probe")
+    try:
+        if live_cdp:
+            app.navigate("/responsive-async")
+            desktop_overflow = int(app.metrics().get("overflow_elements") or 0)
+            vp = app.set_viewport("mobile")
+            mobile_overflow = int(app.metrics().get("overflow_elements") or 0)
+            app.click("#load-async")
+            settled = app.wait_settled(timeout=3.0)
+            async_txt = str(app.get("#async-result", "text") or "")
+            net_log = app.network_log()
+            delayed_entry = next((r for r in net_log if "/api/delayed" in str(r.get("url") or "")), None)
+            passed = (
+                desktop_overflow == 0
+                and vp == (375, 812)
+                and mobile_overflow > 0
+                and settled is True
+                and async_txt == "LOADED"
+                and delayed_entry is not None
+                and delayed_entry.get("status") == 200
+            )
+        else:
+            vp = app.set_viewport("mobile")
+            passed = vp == (375, 812)
+    finally:
+        app.close()
+    return {
+        "id": "W7_responsive_viewport_and_network_idle",
+        "mode": "cdp" if live_cdp else "offline",
+        "passed": bool(passed),
+        "seconds": round(time.monotonic() - t0, 2),
+    }
+
+
+def _bench_r1_state_loop_escape_and_html_fidelity() -> dict[str, Any]:
+    t0 = time.monotonic()
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = Path(tmp) / "run_loop"
+        run_dir.mkdir()
+
+        class LoopEscapeHarness(Harness):
+            goal = "Escape a deceptive no-op option and complete 3 state increments"
+            tick_hz = 100.0
+            stall_seconds = 5.0
+
+            def setup(self, app: App) -> None:
+                app.engine.set_state_direct("counter", "n", 0)
+                self.plan = [
+                    Step("count_up", "Reach n >= 3", done=lambda o: o["n"] >= 3, options=["decoy_noop", "advance"]),
+                ]
+
+            def observe(self, app: App) -> dict[str, Any]:
+                return {"n": int(app.get("counter", "n") or 0)}
+
+            def options(self, obs: dict[str, Any]) -> list[Option]:
+                def decoy(app: App, o: dict[str, Any]):
+                    yield
+                    return Result(True, "did nothing")
+
+                def advance(app: App, o: dict[str, Any]):
+                    yield
+                    app.engine.set_state_direct("counter", "n", int(app.get("counter", "n") or 0) + 1)
+                    return Result(True, "advanced")
+
+                return [
+                    Option("decoy_noop", "Deceptive no-op", decoy, effect=None),
+                    Option("advance", "Advance state", advance, effect=lambda a, b: b["n"] > a["n"]),
+                ]
+
+            def status(self, obs: dict[str, Any]) -> Status:
+                return Status("done", "reached 3", {"n": obs["n"]}) if obs["n"] >= 3 else Status()
+
+        eng = WebEngine(use_cdp=False)
+        eng._frames.append(b"\x89PNG\r\n\x1a\nfake_png_frame")
+        app = App(eng, mode="episode")
+        ep = runtime.run_harness(
+            LoopEscapeHarness,
+            app,
+            seconds=4.0,
+            trace_path=run_dir / "trace1.jsonl",
+        )
+        (run_dir / "report.json").write_text(
+            json.dumps({"outcome": "CONFIRMED", "summary": "Loop escaped and frames saved"}),
+            encoding="utf-8",
+        )
+        html_out = Path(report_html.generate_html(run_dir))
+        html_txt = html_out.read_text(encoding="utf-8")
+        # Decoy should run at most once before loop-aware policy favors `advance`
+        decoy_runs = (ep.get("option_stats") or {}).get("decoy_noop", {}).get("runs", 0)
+        passed = (
+            ep["state"] == "done"
+            and decoy_runs <= 1
+            and len(ep.get("saved_frames") or []) >= 1
+            and "advance" in html_txt
+            and "No trace decisions recorded." not in html_txt
+            and "data:image/png;base64," in html_txt
+        )
+    return {
+        "id": "R1_state_loop_escape_and_html_fidelity",
+        "mode": "unit",
+        "passed": bool(passed),
+        "seconds": round(time.monotonic() - t0, 2),
+    }
+
+
 def run_benchmark(live_browser: bool | str = "auto") -> dict[str, Any]:
-    """Execute the full Brain Autopilot v3 benchmark suite and return scored summary."""
+    """Execute the full Brain Autopilot v3.1 benchmark suite and return scored summary."""
     has_browser = find_browser_binary() is not None
     use_cdp = has_browser if live_browser == "auto" else bool(live_browser and has_browser)
     started = time.monotonic()
@@ -518,10 +775,14 @@ def run_benchmark(live_browser: bool | str = "auto") -> dict[str, Any]:
                 _bench_w2_bug_detectors(srv.base_url, use_cdp, shared_cdp=shared_cdp),
                 _bench_w3_a11y_and_perf(srv.base_url, use_cdp, shared_cdp=shared_cdp),
                 _bench_w4_session_reuse(srv.base_url, use_cdp, shared_cdp=shared_cdp),
+                _bench_w5_shadow_dom_and_aria_refs(srv.base_url, use_cdp, shared_cdp=shared_cdp),
+                _bench_w6_dialog_and_occlusion_guard(srv.base_url, use_cdp, shared_cdp=shared_cdp),
+                _bench_w7_responsive_viewport_and_network_idle(srv.base_url, use_cdp, shared_cdp=shared_cdp),
                 _bench_m1_mobile_accessibility(),
                 _bench_d1_webgl3d_canvas(srv.base_url, use_cdp, shared_cdp=shared_cdp),
                 _bench_v1_vision_and_redaction(),
                 _bench_e1_doctor_and_report_html(),
+                _bench_r1_state_loop_escape_and_html_fidelity(),
             ]
     finally:
         if shared_cdp is not None:
@@ -529,7 +790,7 @@ def run_benchmark(live_browser: bool | str = "auto") -> dict[str, Any]:
 
     passed_count = sum(1 for r in results if r["passed"])
     return {
-        "suite": "brain-autopilot-core-v3",
+        "suite": "brain-autopilot-core-v3.1",
         "browser_available": has_browser,
         "cdp_enabled": use_cdp,
         "score": passed_count,

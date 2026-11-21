@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
+## [3.1.0] - 2026-11-21
+
+### Fixed
+- **Warm CDP `reset_page()` Navigation Bug:** Added `wait_load: bool = True` to `CDPSession.navigate()` so `reset_page()` actually navigates to `about:blank` (previously raised a swallowed `TypeError`), resets viewport overrides, clears in-flight network tracking, dialogs, and occlusion events cleanly.
+- **HTML Report Trace Timeline Bug:** Fixed `report_html.generate_html()` to parse real runtime `kind="decision"` trace rows (in addition to legacy `type="decision"`), displaying `effect`, `state_changed`, `why`, outcome severity colors, and findings from both trace and `report.json`.
+- **WCAG Unlabeled Control False Positives:** Upgraded `DOM_SNAPSHOT_JS` accessible name computation to resolve `aria-labelledby`, `<label for="...">`, wrapping `<label>`, `title`, and `<input type="submit/button" value>`, eliminating false `a11y_unlabeled_control` warnings on properly labeled form controls.
+- **Episode PNG Frame Persistence:** `run_harness(..., trace_path=...)` now persists captured PNG screenshots directly into the run directory (`frame_NN_<label>.png`) so `report_html` automatically embeds real episode screenshots.
+
+### Added
+- **Playwright MCP Parity — Open Shadow DOM Piercing & ARIA Ref Tree (`e1..eN`):** `DOM_SNAPSHOT_JS` and multi-strategy element locators recursively pierce open `shadowRoot` trees, assign deterministic `[ref=eN]` handles, and expose compact `app.aria_snapshot()` / MCP `snapshot.aria_snapshot` trees.
+- **Playwright-Style Actionability & Occlusion Guard (`elementFromPoint`):** `CDPSession.click()` verifies visibility and drills through Shadow DOM `elementFromPoint(cx, cy)` before clicking, rejecting clicks blocked by modal backdrops/overlays and recording `occluded_interactive` findings.
+- **Non-Deadlocking JS Dialog Interceptor (`Page.javascriptDialogOpening`):** Automatically intercepts and handles `alert`/`confirm`/`prompt` dialogs on a worker thread so autonomous runs never hang, logging dialogs into `app.dialogs()` and `js_dialog_blocked`.
+- **Responsive Viewport Emulation & Real Network-Idle Tracking:** Added `app.set_viewport("mobile"|"android"|"tablet"|"desktop"|"WxH")`, MCP `set_viewport` tool, CLI `--viewport` flag, `CDPSession.wait_for_network_idle()`, `app.network_log()`, and network-idle-aware `WebEngine.wait_settled()`.
+- **Self-Healing Multi-Strategy Locators & `contenteditable` Support:** Locators resolve `ref=eN`, CSS selectors, `#id`, `data-testid`, `name`, and accessible names across document & Shadow DOM, and `fill()` supports `contenteditable="true"` editors alongside `<input>`, `<textarea>`, and `<select>`.
+- **Loop-Aware Decision Policy (`runtime.py`):** Fingerprints public `facts(obs)` per decision (`state_changed`), deprioritizes options proven to be no-ops in the current state, favors high-yield options, and ensures pure no-op loops trigger `stall_seconds`.
+- **Expanded v3.1 Detectors (`detectors.py`):** Added `a11y_duplicate_id`, `hydration_error`, `js_dialog_blocked`, `occluded_interactive`, and `slow_network` (`max_request_ms`).
+- **Expanded 12-Task Benchmark Suite (`brain-autopilot-core-v3.1`):** Added `W5_shadow_dom_and_aria_refs`, `W6_dialog_and_occlusion_guard`, `W7_responsive_viewport_and_network_idle`, and `R1_state_loop_escape_and_html_fidelity`.
+
 ## [3.0.0] - 2026-11-20
 
 ### Fixed
