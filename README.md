@@ -11,6 +11,47 @@ Benchmarked against [`ramenvr/autopilot`](https://github.com/ramenvr/autopilot),
 
 ---
 
+## Why Brain Autopilot? (What This MCP Does for AI Agents)
+
+Most AI coding assistants write code **blind** — they guess that a button works, hallucinate DOM states, get stuck in infinite retry loops, or claim *"fixed"* without ever launching the live app.
+
+**Brain Autopilot is the empirical runtime, eyes, hands, and long-term QA memory for AI agents** (via **MCP Server**, **CLI**, and **Agent Skill**). Instead of letting an AI guess, it connects the agent directly to your running Web, Mobile, or 3D application to **probe, click, fill, playtest, detect bugs, verify visually, and record deterministic regressions**.
+
+### Standard AI Models → Frontier-Class, Industrial-Grade Results
+
+> **Core Design Principle:** You do **not** need the most expensive frontier model to get world-class verification. Brain Autopilot offloads brittle browser mechanics, anti-looping, bug detection, and visual sanity checks into a **deterministic industrial runtime** — enabling even standard or lightweight AI models to deliver **frontier-grade accuracy, reliability, and engineering rigor**.
+
+| Challenge for Standard AI Models | How Brain Autopilot Solves It Deterministically |
+| :--- | :--- |
+| **Fragile selectors & Shadow DOM blind spots** | Hands the AI a compact Playwright-style **ARIA `[ref=eN]` tree** that pierces open Shadow DOM & same-origin `<iframe>`s, backed by self-healing multi-strategy locators (`ref`, `CSS.escape`, `data-testid`, `data-test`, `name`, accessible name). |
+| **Infinite no-op retry loops** | Runtime computes live `facts(obs)` state fingerprints (`state_changed`), automatically deprioritizes no-op actions per state, and escapes stalls cleanly with `restart=False` resumption. |
+| **Missed UI/UX, A11y & Perf regressions** | Built-in industrial **Bug, WCAG A11y & Perf Detectors** automatically catch console/hydration errors, 4xx/5xx & slow requests, occluded controls, blocking JS dialogs, CLS > 0.1, desktop/mobile overflow, `<44x44px` touch targets, duplicate IDs, unlabeled controls, and blank 3D canvases. |
+| **Visual confirmation bias ("looks fine to me")** | **Blind Vision (`describe_frames`)** strips expectations so visual inspection only reports what is genuinely visible in captured PNG frames. |
+| **Starting from zero every session** | **Compound Project Memory** (`notes.md`, reusable `lib.py`, and incremental `.codex-seen.json.gz` diffs) preserves learned routes and helpers across runs, while `CONFIRMED` flows replay with **zero LLM cost** via `brain-autopilot regress`. |
+| **Leaking secrets & messy handoffs** | Built-in **`Redactor`** scrubs tokens, credentials, emails, and host paths, while **`report.html`** exports an audit-ready, self-contained dark-mode report with timelines and embedded screenshots. |
+
+### What Each MCP Tool Gives Your AI (`13 Built-in Tools`)
+
+When connected via `brain-autopilot mcp`, any MCP-compatible AI client (Google Antigravity, Claude Desktop, Claude Code, Codex, Cursor, VS Code) gains full autonomous QA & playtesting capabilities:
+
+| MCP Tool | What It Enables the AI To Do |
+| :--- | :--- |
+| `start_run` | Index the codebase (`codex` SHA-256 diff), load project memory (`notes.md`/`lib.py`), active workflow (`verify`/`goal`/`explore`), and detector rules. |
+| `probe` | Run live Python probes against the running app (`app.ui()`, `click()`, `fill()`, `aria_snapshot()`) to verify selectors and routes before building a harness. |
+| `check_harness` | Dry-run `harness.py` (`setup()`, `observe()`, every legal `Option`) to catch broken selectors or contracts fast. |
+| `run_harness` | Execute an autonomous decision-loop episode with real user inputs, loop-escape policy, and automatic PNG frame capture (`restart=false` resumes from stalls). |
+| `snapshot` | Inspect current route, compact ARIA `[ref=eN]` tree, Shadow DOM/iframe controls, console/network errors, dialogs, metrics, and detector findings. |
+| `set_viewport` | Switch responsive viewports (`mobile`, `android`, `tablet`, `desktop`, or `WxH`) to catch mobile-only layout and overflow bugs. |
+| `describe_frames` | Perform strictly blind, unbiased visual inspection on captured episode screenshots + automatic visual anomaly sweep. |
+| `codex_diff` | Check which source files changed since the previous verification run to focus testing on real diffs. |
+| `regress` | Replay saved `CONFIRMED` verification episodes deterministically with **zero LLM calls** to prevent regressions. |
+| `detectors` | Read or configure `detectors.json` (mute known false positives or toggle detector rules per project). |
+| `doctor` | Diagnose Python environment, IDE static typing (`.pth`), Chrome/Edge CDP, Android ADB, and Antigravity skill wiring. |
+| `wait` | Wait cleanly for long-running background probes or episodes without timing out. |
+| `report` | Submit the final empirical verdict (`CONFIRMED`/`DENIED`/`achieved`), auto-save regressions, scrub secrets, and generate `report.html`. |
+
+---
+
 ## Architecture & Upgraded v3.1 Pillars
 
 ```mermaid
